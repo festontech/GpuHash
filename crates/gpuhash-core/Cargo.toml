@@ -1,0 +1,27 @@
+[package]
+name = "gpuhash-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Core engine for the GPU Password Auditing Framework — an educational password auditor."
+
+[lints.rust]
+unsafe_code = "deny"
+rust_2018_idioms = "warn"
+
+[dependencies]
+serde      = { workspace = true }
+thiserror  = { workspace = true }
+tracing    = { workspace = true }
+tokio      = { workspace = true }
+tokio-util = { workspace = true }
+md-5       = { workspace = true }
+
+# Phase 4+ dependencies (uncomment as the roadmap progresses):
+# rayon    = { workspace = true }
+# Phase 5:
+# sha1     = { workspace = true }
+# sha2     = { workspace = true }
+# Phase 2/3:
+# wgpu     = { workspace = true }
+# bytemuck = { workspace = true }

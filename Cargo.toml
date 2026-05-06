@@ -1,0 +1,56 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/gpuhash-core",
+    "crates/gpuhash-cli",
+]
+# crates/gpuhash-tauri is added in Phase 7 via `npm create tauri-app`.
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/tycho-vanooijen/GpuHash"
+rust-version = "1.75"
+
+[workspace.dependencies]
+# Async / runtime — pulled in starting Phase 1.
+tokio              = { version = "1", features = ["rt-multi-thread", "sync", "macros", "time"] }
+tokio-util         = "0.7"
+
+# (De)serialization — used by the EngineEvent / AttackConfig contract.
+serde              = { version = "1", features = ["derive"] }
+serde_json         = "1"
+
+# CLI parsing.
+clap               = { version = "4", features = ["derive"] }
+
+# Errors.
+anyhow             = "1"
+thiserror          = "1"
+
+# Logging.
+tracing            = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# GPU — pulled in starting Phase 2.
+wgpu               = "22"
+bytemuck           = { version = "1", features = ["derive"] }
+
+# CPU parallelism — pulled in starting Phase 1.
+rayon              = "1"
+
+# Reference hash impls (CPU prototype + test vectors).
+md-5               = "0.10"
+sha1               = "0.10"
+sha2               = "0.10"
+
+[profile.release]
+lto             = "thin"
+codegen-units   = 1
+opt-level       = 3
+debug           = "line-tables-only"
+
+# Faster dev builds, still optimized enough for hash benchmarking.
+[profile.dev.package."*"]
+opt-level = 2
