@@ -1,23 +1,34 @@
 //! CPU reference implementations of the supported hash algorithms.
 //!
-//! These are the *correctness baseline*: the GPU shaders added in Phase 3 must agree
-//! with these byte-for-byte. The RFC 1321 / NIST test vectors live as inline tests so
-//! `cargo test -p gpuhash-core` catches regressions immediately.
+//! These are the *correctness baseline*: the GPU shaders must agree with these
+//! byte-for-byte. RFC 1321 (MD5) / NIST FIPS 180-4 (SHA-1, SHA-256) test vectors
+//! live as inline tests so `cargo test -p gpuhash-core` catches regressions
+//! immediately.
 
-use crate::{Algorithm, Error, Result};
+use crate::{Algorithm, Result};
 use md5::{Digest as _, Md5};
+use sha1::Sha1;
+use sha2::Sha256;
 
 /// Compute `algo`'s digest of `input` and return it as raw bytes.
 pub fn digest(algo: Algorithm, input: &[u8]) -> Result<Vec<u8>> {
-    match algo {
+    Ok(match algo {
         Algorithm::Md5 => {
-            let mut hasher = Md5::new();
-            hasher.update(input);
-            Ok(hasher.finalize().to_vec())
+            let mut h = Md5::new();
+            h.update(input);
+            h.finalize().to_vec()
         }
-        Algorithm::Sha1 => Err(Error::NotImplemented("sha1 (lands in Phase 5)")),
-        Algorithm::Sha256 => Err(Error::NotImplemented("sha256 (lands in Phase 5)")),
-    }
+        Algorithm::Sha1 => {
+            let mut h = Sha1::new();
+            h.update(input);
+            h.finalize().to_vec()
+        }
+        Algorithm::Sha256 => {
+            let mut h = Sha256::new();
+            h.update(input);
+            h.finalize().to_vec()
+        }
+    })
 }
 
 /// Hex-format a digest (lowercase, no separators). Useful in logs and tests.
@@ -61,15 +72,44 @@ mod tests {
         }
     }
 
+    /// NIST FIPS 180-4 / RFC 3174 SHA-1 test vectors.
     #[test]
-    fn unsupported_algorithms_return_not_implemented() {
-        assert!(matches!(
-            digest(Algorithm::Sha1, b"x"),
-            Err(Error::NotImplemented(_))
-        ));
-        assert!(matches!(
-            digest(Algorithm::Sha256, b"x"),
-            Err(Error::NotImplemented(_))
-        ));
+    fn nist_sha1_vectors() {
+        let cases = [
+            ("", "da39a3ee5e6b4b0d3255bfef95601890afd80709"),
+            ("a", "86f7e437faa5a7fce15d1ddcb9eaeaea377667b8"),
+            ("abc", "a9993e364706816aba3e25717850c26c9cd0d89d"),
+            (
+                "abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq",
+                "84983e441c3bd26ebaae4aa1f95129e5e54670f1",
+            ),
+        ];
+        for (input, want) in cases {
+            let got = digest(Algorithm::Sha1, input.as_bytes()).unwrap();
+            assert_eq!(to_hex(&got), want, "input = {input:?}");
+        }
+    }
+
+    /// NIST FIPS 180-4 SHA-256 test vectors.
+    #[test]
+    fn nist_sha256_vectors() {
+        let cases = [
+            (
+                "",
+                "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            ),
+            (
+                "abc",
+                "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+            ),
+            (
+                "abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq",
+                "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1",
+            ),
+        ];
+        for (input, want) in cases {
+            let got = digest(Algorithm::Sha256, input.as_bytes()).unwrap();
+            assert_eq!(to_hex(&got), want, "input = {input:?}");
+        }
     }
 }
