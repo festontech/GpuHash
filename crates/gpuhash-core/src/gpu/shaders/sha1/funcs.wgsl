@@ -60,20 +60,7 @@ fn sha1_block(M_in: array<u32, 16>) -> array<u32, 5> {
     return array<u32, 5>(a + a0, b + b0, c + c0, d + d0, e + e0);
 }
 
-// Big-endian padding: 0x80 marker at byte `len`, then zero-pad, then 64-bit
-// bit-length BE in the last 8 bytes.
-fn sha1_pad_block(M_in: array<u32, 16>, len: u32) -> array<u32, 16> {
-    var M = M_in;
-    let word_idx = len >> 2u;
-    let byte_in_word = len & 3u;
-    // BE: byte 0 of a word lives in the high-order byte (shift 24).
-    let shift = (3u - byte_in_word) * 8u;
-    M[word_idx] = M[word_idx] | (0x80u << shift);
-
-    M[14] = 0u;          // upper 32 bits of bit-length (0 for len < 2^29)
-    M[15] = len << 3u;   // lower 32 bits, already in BE u32 representation
-    return M;
-}
+// SHA-1 uses the shared `pad_be_block` from `common/match.wgsl`.
 
 fn scan_targets_sha1(
     h: array<u32, 5>,

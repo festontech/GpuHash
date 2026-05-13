@@ -7,6 +7,7 @@
 //! See `docs/ARCHITECTURE.md` for the full design.
 
 pub mod attacks;
+pub mod benchmark;
 pub mod config;
 pub mod digest;
 pub mod engine;
@@ -22,6 +23,7 @@ pub mod mask;
 // pub mod benchmark;
 // pub mod session;
 
+pub use benchmark::{benchmark_algo, BenchmarkConfig, BenchmarkReport};
 pub use config::{AttackConfig, AttackMode, Backend, GpuTuning};
 pub use engine::{Engine, RunningAttack};
 pub use error::{Error, Result};

@@ -346,7 +346,7 @@ impl BruteforceRunner {
 mod tests {
     use super::*;
     use crate::digest::digest;
-    use crate::gpu::algos::{md5 as md5_kernel, sha1 as sha1_kernel};
+    use crate::gpu::algos::{md5 as md5_kernel, sha1 as sha1_kernel, sha256 as sha256_kernel};
     use crate::gpu::runner::DEFAULT_MAX_IN_FLIGHT;
     use crate::Algorithm;
 
@@ -397,6 +397,11 @@ mod tests {
     #[tokio::test]
     async fn sha1_brute_matches_cpu_reference() {
         assert_brute_matches_cpu(Algorithm::Sha1, sha1_kernel::BRUTE_SPEC).await;
+    }
+
+    #[tokio::test]
+    async fn sha256_brute_matches_cpu_reference() {
+        assert_brute_matches_cpu(Algorithm::Sha256, sha256_kernel::BRUTE_SPEC).await;
     }
 
     #[tokio::test]

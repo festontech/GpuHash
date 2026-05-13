@@ -368,7 +368,7 @@ impl DictRunner {
 mod tests {
     use super::*;
     use crate::digest::digest;
-    use crate::gpu::algos::{md5 as md5_kernel, sha1 as sha1_kernel};
+    use crate::gpu::algos::{md5 as md5_kernel, sha1 as sha1_kernel, sha256 as sha256_kernel};
     use crate::gpu::buffers::CandidateSlot;
     use crate::Algorithm;
 
@@ -419,6 +419,11 @@ mod tests {
     #[tokio::test]
     async fn sha1_dict_matches_cpu() {
         assert_dict_matches_cpu(Algorithm::Sha1, sha1_kernel::DICT_SPEC).await;
+    }
+
+    #[tokio::test]
+    async fn sha256_dict_matches_cpu() {
+        assert_dict_matches_cpu(Algorithm::Sha256, sha256_kernel::DICT_SPEC).await;
     }
 
     #[tokio::test]

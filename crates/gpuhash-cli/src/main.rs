@@ -9,7 +9,10 @@ use std::process::ExitCode;
 
 use anyhow::{bail, Result};
 use clap::{Parser, Subcommand};
-use gpuhash_core::{Algorithm, AttackConfig, AttackMode, Backend, Engine, EngineEvent, GpuTuning};
+use gpuhash_core::{
+    benchmark_algo, Algorithm, AttackConfig, AttackMode, Backend, BenchmarkConfig, Engine,
+    EngineEvent, GpuTuning,
+};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -77,9 +80,18 @@ enum Cmd {
         #[arg(long, value_parser = parse_algo)]
         algo: Option<Algorithm>,
 
-        /// Sustained measurement window, in seconds.
-        #[arg(long, default_value_t = 60)]
+        /// Sustained measurement window, in seconds (default 5; Phase 9 sweep
+        /// uses ≥ 60 for thermal-aware sustained throughput).
+        #[arg(long, default_value_t = 5)]
         secs: u64,
+
+        /// Override GPU batch size (default 1<<18).
+        #[arg(long, value_name = "N")]
+        gpu_batch: Option<u32>,
+
+        /// Override GPU workgroup size (32, 64, 128, or 256; default 256).
+        #[arg(long, value_name = "N")]
+        gpu_workgroup: Option<u32>,
     },
 }
 
@@ -146,10 +158,45 @@ async fn dispatch(cli: Cli) -> Result<ExitCode> {
             .await
         }
 
-        Cmd::Benchmark { .. } => {
-            bail!("benchmark: not yet implemented (lands in Phase 2+)");
-        }
+        Cmd::Benchmark {
+            algo,
+            secs,
+            gpu_batch,
+            gpu_workgroup,
+        } => run_benchmark(algo, secs, gpu_batch, gpu_workgroup).await,
     }
+}
+
+async fn run_benchmark(
+    algo: Option<Algorithm>,
+    secs: u64,
+    gpu_batch: Option<u32>,
+    gpu_workgroup: Option<u32>,
+) -> Result<ExitCode> {
+    let algos: Vec<Algorithm> = match algo {
+        Some(a) => vec![a],
+        None => vec![Algorithm::Md5, Algorithm::Sha1, Algorithm::Sha256],
+    };
+    let cfg = BenchmarkConfig {
+        secs,
+        batch_size: gpu_batch,
+        workgroup_size: gpu_workgroup,
+    };
+
+    for a in algos {
+        let report = benchmark_algo(a, cfg).await?;
+        println!(
+            "{:<7} {:>10.1} MH/s   ({} candidates in {:.2}s, batch={}, wg={})",
+            format!("{a}:"),
+            report.hashes_per_sec / 1e6,
+            report.candidates_tested,
+            report.elapsed_secs,
+            report.batch_size,
+            report.workgroup_size,
+        );
+    }
+
+    Ok(ExitCode::SUCCESS)
 }
 
 #[allow(clippy::too_many_arguments)]

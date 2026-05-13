@@ -319,3 +319,132 @@ example; bruteforce found admin / hello / dragon / monkey / qwerty from
   surface starts mattering once we have three algorithms to compare.
 
 ---
+
+## 2026-05-13 — SHA-1 + SHA-256 + benchmark (Phase 5)
+
+**Goal today.** Ship SHA-1 and SHA-256 on both CPU and GPU paths, behind clean
+per-algorithm boundaries, plus a `benchmark` subcommand that prints one H/s
+number per algorithm for *this* Intel iGPU.
+
+**What I did.** Four commits, one logical phase:
+
+1. **CPU baselines** (`6082e89`). Uncommented `sha1` and `sha2` deps; wired
+   them into `digest::digest`. Added inline NIST FIPS 180-4 / RFC 3174 vectors
+   (3 + 3 cases) alongside the existing RFC 1321 MD5 vectors. The
+   `unsupported_algorithms_return_not_implemented` test went away — there are
+   no unsupported algorithms on the CPU path anymore.
+
+2. **GPU SHA-1 + architectural refactor** (`bbe4774`). The original Phase-3
+   shader layout (`md5_common.wgsl` + `md5_dict.wgsl` + `md5_bruteforce.wgsl`)
+   would have triplicated for two more algorithms — ~60 lines of mask-
+   decomposition logic copied per (algo, mode) pair, plus duplicated
+   CandidateSlot / Params / MaskPos struct declarations. Refactored before
+   adding SHA-1:
+
+   ```
+   gpu/shaders/
+     common/
+       match.wgsl       MatchBuf + targets/match_buf bindings + rotl/byteswap
+                        + pad_be_block
+       dict.wgsl        CandidateSlot + dict Params + bindings 0 & 3
+       bruteforce.wgsl  MaskPos + brute Params + bindings 0 & 3 +
+                        synthesize_candidate_le
+     md5/{funcs,dict,bruteforce}.wgsl
+     sha1/{funcs,dict,bruteforce}.wgsl
+     sha256/{funcs,dict,bruteforce}.wgsl
+
+   gpu/algos/
+     mod.rs             pub mod md5; pub mod sha1; pub mod sha256;
+     md5.rs             FUNCS, DICT_ENTRY, BRUTE_ENTRY, DICT_SPEC, BRUTE_SPEC
+     sha1.rs            (same shape)
+     sha256.rs          (added in commit 4)
+
+   gpu/runner.rs           DictRunner — generic over DictKernelSpec
+   gpu/bruteforce_runner.rs   BruteforceRunner — generic over BruteforceKernelSpec
+   gpu/kernel_spec.rs      Endianness, Dict/BruteforceKernelSpec, assemble_shader,
+                           shared common-fragment include_str!s, pack_target_words
+   ```
+
+   Adding a new algorithm now = one folder under `shaders/<algo>/` with three
+   ~15-line files, one Rust file under `algos/<algo>.rs` with the spec
+   constants, and one match arm in `engine::run_gpu`. Everything else in the
+   GPU stack is algorithm-agnostic.
+
+3. *(folded into commit 2)* Generalized `Md5GpuRunner` → `DictRunner` and
+   `Md5BruteforceRunner` → `BruteforceRunner`; targets pack via
+   `pack_target_words(targets, digest_bytes, endian)`, so MD5's LE-state-words
+   path and SHA-1/SHA-256's BE-state-words path share the same Rust code.
+
+4. **GPU SHA-256 + benchmark** (this commit). One new shader folder, one
+   `algos/sha256.rs`, one engine arm. `crate::benchmark::benchmark_algo`
+   drives the bruteforce runner over `?l^6` (looping the cursor back to 0 as
+   needed) for a configurable wall-clock budget, counts how many candidates
+   actually cleared the pipeline, and reports `H/s`. The `gpuhash benchmark`
+   CLI subcommand calls it once per algorithm (or per `--algo`).
+
+**What worked.** The architecture refactor paid for itself immediately:
+SHA-256 compiled and matched the CPU reference on the first attempt. The CPU
+SHA-1 / SHA-256 paths are a 1-line plumbing change each thanks to the
+`RustCrypto` family. The benchmark loop reuses the engine's slot/ring
+discipline almost verbatim.
+
+**What didn't / surprises.**
+- **WGSL "no dynamic indexing of let-bound arrays" bit me again.** Inside
+  `sha1_block`, copying the function parameter into a local `var` was needed
+  to allow `W[i] = M[i];` to use a dynamic `i`. The same rule fires inside the
+  bruteforce kernels where they want to iterate over the LE bytes returned by
+  `synthesize_candidate_le`. Each new shader needs `var M = M_in;` /
+  `var bytes_le = synthesize_candidate_le(...);` at the top. Worth a paragraph
+  in a "WGSL gotchas" section of ARCHITECTURE.md eventually.
+- **Big-endian padding was duplicated** between SHA-1 and SHA-256 in the first
+  draft. Moved `pad_be_block(M, len)` into `common/match.wgsl` since it's a
+  generic BE-padding utility — both consumers shrunk.
+- **SHA-1 GPU is *slightly faster than MD5* in the bruteforce benchmark**
+  (276 vs 252 MH/s). Counterintuitive — SHA-1 does 80 rounds + a 64-word
+  message-schedule expansion vs MD5's 64-round flat schedule. Hypothesis: the
+  iGPU's instruction issue is so over-provisioned for the per-thread MD5
+  workload that adding more arithmetic per thread *raises* effective occupancy
+  by hiding memory latency. Worth re-checking with Intel GPA in Phase 9.
+- **SHA-256 is ~2.5× slower than MD5**, in line with the architecture doc's
+  rough expectation table for an Iris-tier part (165 MH/s reference, we hit
+  102 MH/s on this UHD chip).
+
+**Decisions made.**
+- **No `HashKernel` trait yet.** The factoring into specs + generic runners
+  already removes the duplication; a trait adds nothing concrete until the
+  Phase-10 WGSL↔OpenCL bake-off, when a second backend implementation gives
+  the trait something to abstract.
+- **Two `Params` structs (dict vs brute) instead of one.** Each lives in its
+  own `common/*.wgsl` file. Sharing would have forced unused fields on the
+  dict path (or unused `base_index = 0` on every dispatch). Two structs, one
+  per mode, is clearer.
+- **`benchmark` lives in `crate::benchmark`, not in `engine.rs`.** Matches
+  the architecture doc's layout and keeps the engine focused on the
+  attack-driving event loop.
+- **WGSL workgroup-size substitution remains a string `.replace`.** Naga's
+  `override` constants would be cleaner; deferred to Phase 9 cleanup.
+
+**Numbers.** Release build, this Intel UHD Graphics, Vulkan, `--secs 5`:
+
+| Algorithm | Rate           | Comparable (CLAUDE.md, Iris-tier rough) |
+| ---       | ---:           | ---:                                    |
+| MD5       | **251.7 MH/s** | ~300 MH/s – 1 GH/s                      |
+| SHA-1     | **275.8 MH/s** | (not specified)                         |
+| SHA-256   | **102.4 MH/s** | ~165 MH/s                               |
+
+Same `?l^6` mask, default tuning (batch=1<<18, wg=256), one bogus target. The
+benchmark loops the keyspace cursor back to 0 once it laps; with these rates
+we wrap once per ~1.1 s for MD5/SHA-1 and once per ~3 s for SHA-256.
+
+Correctness end-to-end:
+- `--algo sha1   --gpu` finds password / admin / welcome on a 3-target SHA-1 file.
+- `--algo sha256 --gpu` finds password / admin / letmein on a 3-target SHA-256 file.
+- 36/36 unit tests pass (added `sha256_dict_matches_cpu` and
+  `sha256_brute_matches_cpu_reference` alongside the existing MD5/SHA-1 ones).
+
+**Next.**
+- Phase 6: CLI polish — `--json` (already present, sanity-check), session
+  list/save/load, and exit-code review. Then Phase 7: Tauri shell and the
+  React frontend.
+
+---

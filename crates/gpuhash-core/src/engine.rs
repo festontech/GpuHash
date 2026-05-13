@@ -32,7 +32,7 @@ use crate::{
     digest::digest,
     event::{AttackSummary, EngineEvent},
     gpu::{
-        algos::{md5 as md5_kernel, sha1 as sha1_kernel},
+        algos::{md5 as md5_kernel, sha1 as sha1_kernel, sha256 as sha256_kernel},
         bruteforce_runner::BruteforceRunner,
         buffers::{CandidateSlot, MAX_CANDIDATE_LEN},
         kernel_spec::{BruteforceKernelSpec, DictKernelSpec},
@@ -51,7 +51,7 @@ use crate::{
 /// entry for the full grid. Total device memory for the bruteforce path is
 /// trivial; the dictionary path holds `batch_size × 60` bytes per slot × 2 slots
 /// = ~31 MB at this default, which is fine on a typical iGPU.
-const DEFAULT_GPU_BATCH: u32 = 1 << 18;
+pub const DEFAULT_GPU_BATCH: u32 = 1 << 18;
 
 #[derive(Default)]
 pub struct Engine;
@@ -163,11 +163,7 @@ async fn run_gpu(
     let (dict_spec, brute_spec) = match cfg.algo {
         Algorithm::Md5 => (md5_kernel::DICT_SPEC, md5_kernel::BRUTE_SPEC),
         Algorithm::Sha1 => (sha1_kernel::DICT_SPEC, sha1_kernel::BRUTE_SPEC),
-        Algorithm::Sha256 => {
-            return Err(Error::NotImplemented(
-                "GPU SHA-256 lands in the next Phase 5 commit",
-            ));
-        }
+        Algorithm::Sha256 => (sha256_kernel::DICT_SPEC, sha256_kernel::BRUTE_SPEC),
     };
 
     let targets: TargetSet = load_targets(&cfg.hashes_path, cfg.algo)?;

@@ -77,10 +77,10 @@ Mark a phase complete by checking its top-level box and adding a logbook entry s
 
 **Goal.** Port additional algorithms by templating shader code. Benchmark suite.
 
-- [ ] `gpu/shaders/sha1.wgsl`.
-- [ ] `gpu/shaders/sha256.wgsl`.
-- [ ] NIST test vectors pass on both CPU and GPU paths.
-- [ ] `gpuhash benchmark` returns three numbers for *this* Intel iGPU.
+- [x] `gpu/shaders/sha1/{funcs,dict,bruteforce}.wgsl` — and the matching `sha256/` folder.
+- [x] `gpu/shaders/sha256/{funcs,dict,bruteforce}.wgsl`.
+- [x] NIST test vectors pass on both CPU and GPU paths (CPU vectors as inline tests; GPU agrees with CPU on the same inputs for all three algorithms via the runner tests).
+- [x] `gpuhash benchmark` returns three numbers for *this* Intel iGPU.
 
 ---
 

@@ -20,7 +20,7 @@ fn sha1_bruteforce(@builtin(global_invocation_id) gid: vec3<u32>) {
     for (var i = 0u; i < 14u; i = i + 1u) {
         M[i] = byteswap(bytes_le[i]);
     }
-    M = sha1_pad_block(M, len);
+    M = pad_be_block(M, len);
     let h = sha1_block(M);
     scan_targets_sha1(h, cand_idx, params.num_targets, params.max_matches);
 }
