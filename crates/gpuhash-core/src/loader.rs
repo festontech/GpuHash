@@ -94,10 +94,7 @@ mod tests {
 
     #[test]
     fn rejects_invalid_hex() {
-        let path = write_temp(
-            "badhex",
-            "ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ\n",
-        );
+        let path = write_temp("badhex", "ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ\n");
         let err = load_targets(&path, Algorithm::Md5).unwrap_err();
         assert!(matches!(err, Error::BadFormat(_)));
         let _ = std::fs::remove_file(path);

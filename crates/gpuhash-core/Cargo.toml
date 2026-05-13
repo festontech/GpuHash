@@ -24,3 +24,6 @@ bytemuck   = { workspace = true }
 # Phase 5:
 # sha1     = { workspace = true }
 # sha2     = { workspace = true }
+
+[dev-dependencies]
+tracing-subscriber = { workspace = true }

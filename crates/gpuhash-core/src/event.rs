@@ -37,19 +37,12 @@ pub enum EngineEvent {
     ///
     /// `target_idx` is the zero-based index into the input hash file (so the consumer
     /// can map back to the original line if it needs to).
-    Match {
-        plaintext: String,
-        target_idx: u32,
-    },
+    Match { plaintext: String, target_idx: u32 },
 
     /// The audit ran to completion (or was cancelled cleanly).
-    Finished {
-        summary: AttackSummary,
-    },
+    Finished { summary: AttackSummary },
 
     /// Unrecoverable error during the audit. The engine will not emit further events
     /// on this channel after `Error`.
-    Error {
-        message: String,
-    },
+    Error { message: String },
 }

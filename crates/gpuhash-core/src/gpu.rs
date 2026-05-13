@@ -122,6 +122,17 @@ mod tests {
 
     #[tokio::test]
     async fn smoke_returns_one() {
+        // Install a tracing subscriber so adapter info (logged at INFO inside `smoke`)
+        // is visible when this test runs with `--nocapture`. `try_init` makes it safe
+        // for any other test in the same binary to also install one.
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(
+                tracing_subscriber::EnvFilter::try_from_default_env()
+                    .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("gpuhash_core=info")),
+            )
+            .with_test_writer()
+            .try_init();
+
         let v = smoke()
             .await
             .expect("smoke() should succeed on any machine with a working GPU adapter");

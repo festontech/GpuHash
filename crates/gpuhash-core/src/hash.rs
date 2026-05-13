@@ -42,7 +42,9 @@ impl std::str::FromStr for Algorithm {
             "md5" => Ok(Algorithm::Md5),
             "sha1" => Ok(Algorithm::Sha1),
             "sha256" => Ok(Algorithm::Sha256),
-            other => Err(format!("unknown algorithm `{other}` — expected md5|sha1|sha256")),
+            other => Err(format!(
+                "unknown algorithm `{other}` — expected md5|sha1|sha256"
+            )),
         }
     }
 }

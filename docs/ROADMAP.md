@@ -40,11 +40,11 @@ Mark a phase complete by checking its top-level box and adding a logbook entry s
 
 **Goal.** Get Appendix A's "smallest possible compute kernel" returning `1` on the laptop's Intel iGPU.
 
-- [ ] Add `wgpu`, `bytemuck` deps to `gpuhash-core`.
-- [ ] Implement `gpu::smoke()` per ARCHITECTURE.md Appendix A.
-- [ ] One green test that the GPU plumbing works end-to-end.
-- [ ] Log adapter info (`Adapter::get_info`) — confirm DX12 backend on Intel.
-- [ ] Logbook: adapter name, backend, driver version.
+- [x] Add `wgpu`, `bytemuck` deps to `gpuhash-core`.
+- [x] Implement `gpu::smoke()` per ARCHITECTURE.md Appendix A.
+- [x] One green test that the GPU plumbing works end-to-end.
+- [x] Log adapter info (`Adapter::get_info`) — Vulkan backend on this Intel iGPU (not DX12; both are valid wgpu backends).
+- [x] Logbook: adapter name, backend, driver version.
 
 ---
 
