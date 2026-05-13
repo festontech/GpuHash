@@ -52,12 +52,12 @@ Mark a phase complete by checking its top-level box and adding a logbook entry s
 
 **Goal.** Port MD5 to WGSL; one batch per dispatch, await each. Match results bit-for-bit against the CPU prototype.
 
-- [ ] `gpu/shaders/md5.wgsl` — full MD5 in WGSL with the 64 round constants.
-- [ ] `gpu/pipeline.rs` — bind group layout, compute pipeline.
-- [ ] `gpu/buffers.rs` — candidate / target / output buffers.
-- [ ] `Engine::run_attack` with `--gpu` flag.
-- [ ] Cross-check: same matches as Phase 1 CPU prototype on the same input.
-- [ ] Logbook: first GPU H/s number.
+- [x] `gpu/shaders/md5.wgsl` — full MD5 in WGSL with the 64 round constants.
+- [x] `gpu/runner.rs` — bind group layout, compute pipeline, persistent buffers (subsumes the planned `pipeline.rs`).
+- [x] `gpu/buffers.rs` — `CandidateSlot` / `Params` / `MatchRecord` POD types.
+- [x] `Engine` routes on `Backend::Gpu`; CLI exposes `--gpu`.
+- [x] Cross-check: same 10/10 matches as Phase 1 CPU prototype on the canonical example. GPU runner unit tests also confirm GPU MD5 agrees with the CPU reference across inputs of 0–26 bytes.
+- [x] Logbook: first GPU H/s number (~6.4 MH/s release on Intel UHD, ~2.2× CPU single-thread — Phase 4 expected to widen the gap).
 
 ---
 

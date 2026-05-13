@@ -9,7 +9,7 @@ use std::process::ExitCode;
 
 use anyhow::{bail, Result};
 use clap::{Parser, Subcommand};
-use gpuhash_core::{Algorithm, AttackConfig, AttackMode, Engine, EngineEvent};
+use gpuhash_core::{Algorithm, AttackConfig, AttackMode, Backend, Engine, EngineEvent};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -53,6 +53,10 @@ enum Cmd {
         /// This is trivially bypassable but exists to document intent — see docs/ETHICS.md.
         #[arg(long)]
         i_own_these_hashes: bool,
+
+        /// Run the audit on the GPU (WGSL via wgpu). MD5 only in Phase 3.
+        #[arg(long)]
+        gpu: bool,
 
         /// Emit NDJSON `EngineEvent`s on stdout instead of human-readable progress.
         #[arg(long)]
@@ -114,9 +118,10 @@ async fn dispatch(cli: Cli) -> Result<ExitCode> {
             wordlist,
             mask,
             session,
+            gpu,
             json,
             i_own_these_hashes: true,
-        } => run_attack(algo, hashes, wordlist, mask, session, json).await,
+        } => run_attack(algo, hashes, wordlist, mask, session, gpu, json).await,
 
         Cmd::Benchmark { .. } => {
             bail!("benchmark: not yet implemented (lands in Phase 2+)");
@@ -130,6 +135,7 @@ async fn run_attack(
     wordlist: Option<PathBuf>,
     mask: Option<String>,
     session_name: Option<String>,
+    gpu: bool,
     json: bool,
 ) -> Result<ExitCode> {
     let mode = match (wordlist, mask) {
@@ -147,6 +153,7 @@ async fn run_attack(
         algo,
         hashes_path: hashes,
         mode,
+        backend: if gpu { Backend::Gpu } else { Backend::Cpu },
         session_name,
     };
 

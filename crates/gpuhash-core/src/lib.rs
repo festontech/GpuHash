@@ -21,7 +21,7 @@ pub mod loader;
 // pub mod benchmark;
 // pub mod session;
 
-pub use config::{AttackConfig, AttackMode};
+pub use config::{AttackConfig, AttackMode, Backend};
 pub use engine::{Engine, RunningAttack};
 pub use error::{Error, Result};
 pub use event::{AttackSummary, EngineEvent};

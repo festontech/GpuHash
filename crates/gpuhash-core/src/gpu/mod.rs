@@ -1,9 +1,13 @@
 //! GPU plumbing — wgpu adapter/device/pipeline scaffolding.
 //!
-//! Phase 2: only `smoke()` exists. It dispatches the smallest possible WGSL kernel
-//! (`data[0] = 1u`) on the local GPU and reads the result back, proving that
-//! adapter/device/pipeline/buffer-mapping all work end-to-end before MD5 (Phase 3)
-//! lands. See [`docs/ARCHITECTURE.md`](../../../../docs/ARCHITECTURE.md) Appendix A.
+//! - [`smoke`] is the Phase-2 smallest-possible-kernel sanity check.
+//! - [`buffers`] / [`runner`] / `shaders/md5.wgsl` form the Phase-3 MD5 dictionary
+//!   attack path. The host packs candidates into fixed-size slots, the WGSL kernel
+//!   computes MD5 per slot and compares against the target list, and matches are
+//!   read back via a small staging buffer.
+
+pub mod buffers;
+pub mod runner;
 
 use bytemuck;
 use wgpu::util::DeviceExt;

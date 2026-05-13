@@ -141,35 +141,51 @@ Append-only, dated entries. The point is twofold: (a) you'll need this for the f
 
 ---
 
-## 2026-05-13 — GPU smoke test (Phase 2)
+## 2026-05-13 — GPU MD5 (Phase 3)
 
-**Goal today.** End-to-end GPU plumbing: adapter → device → pipeline → buffer round-trip. Confirm wgpu works on this Intel iGPU before Phase 3 ports MD5 to WGSL.
+**Goal today.** Port MD5 to WGSL, run it on the Intel iGPU, and prove bit-exact agreement with the Phase 1 CPU reference. Record the first GPU H/s number.
 
 **What I did.**
-- Uncommented `wgpu = "22"` and `bytemuck` in `gpuhash-core/Cargo.toml`; added `gpu` module to [lib.rs](crates/gpuhash-core/src/lib.rs).
-- Wrote [gpu.rs](crates/gpuhash-core/src/gpu.rs) `smoke()` per ARCHITECTURE.md Appendix A — single-element storage buffer, WGSL kernel `data[0] = 1u`, COPY_SRC → MAP_READ staging buffer, `device.poll(Wait)` then mapped-range read.
-- Added `tracing-subscriber` as a dev-dependency so the test can install a subscriber and surface `Adapter::get_info()` on `--nocapture`. Production users of the library install their own subscriber (CLI already does).
-- `cargo test --workspace`: 9/9 pass (the new `gpu::tests::smoke_returns_one` joins the 8 from Phase 1). `cargo fmt --check` and `cargo clippy --workspace --all-targets -- -D warnings` both clean.
+- Converted `gpu.rs` to a `gpu/` directory module so submodules can live alongside the shader assets:
+  - [gpu/mod.rs](../crates/gpuhash-core/src/gpu/mod.rs) — keeps Phase 2 `smoke()`, exports submodules.
+  - [gpu/shaders/md5.wgsl](../crates/gpuhash-core/src/gpu/shaders/md5.wgsl) — full MD5 (64 rounds, 4 mixing functions, message-schedule index per round group). One thread per candidate; on a digest match, atomically reserves a slot in a match buffer.
+  - [gpu/buffers.rs](../crates/gpuhash-core/src/gpu/buffers.rs) — `CandidateSlot` (60-byte POD, `len: u32 + bytes: [u32; 14]`), `Params`, `MatchRecord`. `pack()` packs a byte slice little-endian into `bytes`; caps at `MAX_CANDIDATE_LEN = 55` (single-block MD5).
+  - [gpu/runner.rs](../crates/gpuhash-core/src/gpu/runner.rs) — `Md5GpuRunner` owns device, queue, pipeline, and the persistent storage buffers. `dispatch_batch()` writes candidates, zeroes the match-buffer header, dispatches, copies match-buffer to a `MAP_READ` staging buffer, awaits, returns `Vec<MatchRecord>`.
+- Added [`Backend` enum](../crates/gpuhash-core/src/config.rs) (`Cpu | Gpu`) on `AttackConfig`. `#[serde(default)]` keeps any pre-Phase-3 session JSON readable.
+- Refactored [engine.rs](../crates/gpuhash-core/src/engine.rs) to route on the backend: the CPU loop is unchanged; the GPU loop fills a batch from the candidate source, dispatches via `Md5GpuRunner`, looks each `MatchRecord` back up by candidate index, and emits the same `EngineEvent::Match` shape the CPU path emits. Progress events still throttled to ~10 Hz.
+- Added `--gpu` to the CLI's `attack` subcommand. The user-facing event stream is unchanged.
+- New tests: `gpu::buffers::tests::*` (pack endianness, oversize rejection, layout invariants) and `gpu::runner::tests::*` (8-input batch with CPU-generated targets — every candidate must match its own target; bogus-target case — no matches). Total now 16/16 passing.
 
-**What worked.** First run returned `1u` cleanly. No driver crashes, no validation errors. wgpu's default adapter selection picked the integrated GPU without me having to set power preference.
+**What worked.** Once the kernel compiled, MD5 was correct on the first run for all 8 short inputs in the runner test. Canonical Phase 1 audit (`examples/tiny_dict.txt` against `examples/sample_hashes.txt`) finds 10/10 matches with `--gpu`, identical to the CPU path, exit code 1 as designed.
 
 **What didn't / surprises.**
-- **Backend was Vulkan, not DX12.** The roadmap predicted DX12 on Windows + Intel. wgpu 22 on this machine prefers Vulkan when both backends are available, and the Intel driver exposes a Vulkan ICD (driver_info `101.7084`). Functionally equivalent for our purposes — both go through `wgpu_hal` and end at the same Intel compute units. Noted in the roadmap checkbox so I don't chase this later thinking something is misconfigured.
-- `wgpu::Instance::request_adapter` returns `None` rather than `Result` in this version, so I wrapped it with `ok_or_else` into the engine's `Error::Gpu`. Not a surprise so much as a small API-shape adjustment from how `request_device` looks.
-- First clean compile of `wgpu` + transitive deps was ~80s. Worth noting as the new cost-of-touching the GPU crate; incremental rebuilds are sub-second.
+- **naga rejected dynamic indexing into `const` arrays and into `let`-bound struct fields.** First validation error was `m[i] = slot.bytes[i]` — `let slot = candidates[..]` gave a value-of-array that can only be const-indexed. Changing `let slot` to `var slot` (function-local mutable copy) fixed that, then the same rule fired for `K[i]`/`S[i]`. Resolution: declare K and S as `var<private>` with const initializers. That's the idiomatic WGSL workaround for "a read-only table I want to walk with a dynamic index", and it's documented in the shader comment so I don't keep re-learning it.
+- **Modest 2.2× GPU/CPU speedup on a 2 M synthetic dict** — much less than the "1–2 orders of magnitude" I had in mind. Explanations:
+  - Per-thread MD5 is ~100 instructions of integer work; on an iGPU each batch is bottlenecked by dispatch + readback latency, not arithmetic.
+  - The Phase 3 dispatch model is intentionally serial: each batch fully syncs (`map_async` blocks the next dispatch). Phase 4's ring-buffer scheduler is the design that removes that floor.
+  - The host is doing real CPU work per candidate (read line, UTF-8 validate, allocate `String`, pack into 60-byte slot). Once Phase 4 generates candidates on-GPU from `gid.x`, that goes away.
+  - This matches CLAUDE.md's framing: the "1–2 OOM jump" line assumed brute-force on-GPU candidate generation was already wired; dictionary mode through the host pipeline is the wrong workload to measure on.
+- **Windows Application Control blocked first release build** of an unsigned wgpu build script (`glutin_wgl_sys` build-script-build, OS error 4551). Exempting the cargo target dir / disabling Smart App Control unblocked it. Flagging in case it bites again on a fresh wgpu transitive-dep upgrade.
+- **`MAX_CANDIDATE_LEN = 55` bytes** is the single-block MD5 cap (9 bytes consumed by the 0x80 marker and the 8-byte bit-length). Longer candidates are silently skipped with a final-tally `tracing::warn!`. Real wordlists fit easily; multi-block lands when needed.
 
 **Decisions made.**
-- **`tracing-subscriber` as dev-dep, not regular dep.** A library should not install a global subscriber; that's a binary's job. But the smoke test is the one place inside the library where we want adapter info actually printed (so the logbook entry can quote it). Dev-dep + `with_test_writer()` + `try_init()` gives us that without leaking into the public dependency graph.
-- **Keep the smoke test as a real `#[tokio::test]`, not a manual `cargo run` invocation.** Phase 3 will keep building on this path (real MD5 dispatches), and a passing CI-able test is much more valuable than a one-off binary that drifts.
-- **Did not gate the test with `#[ignore]` or a feature flag.** Risk: CI machines without a GPU adapter would fail. Acceptable for now — the project is scoped to "single Windows laptop with Intel iGPU"; if we ever wire up a headless CI, we'll add `#[ignore]` then.
+- **Match buffer as a single combined struct** (`count: atomic<u32>` + `_pad: [u32; 3]` + `pairs: array<u32>`) instead of two separate bindings. One bind group entry, one staging copy, one map_async.
+- **Pipeline construction is per-`Engine::run` call**, not cached on the `Engine`. Means ~150–300 ms of adapter/device/pipeline init each time. Cheap to fix in Phase 7 (cache a runner on the Tauri command handler), not worth doing yet.
+- **`max_matches = batch_size`** is the per-dispatch cap. Each candidate produces one digest, and with a collision-resistant hash that maps to at most one target match, so this is a safe upper bound on matches-per-dispatch without inflating the staging buffer.
+- **Did not extract `pipeline.rs` separately** as the roadmap had drafted. Pipeline + buffers + dispatch are all owned by `Md5GpuRunner`; splitting them into separate files would have meant exposing internals through a layer that doesn't pay rent yet. Phase 5 (SHA-1/SHA-256) will revisit — that's the right moment to factor out a `HashRunner` trait.
 
-**Numbers.**
-- Adapter: **Intel(R) UHD Graphics**, vendor `32902` (0x8086, Intel), `IntegratedGpu`.
-- Backend: **Vulkan**, driver `Intel Corporation` `101.7084`.
-- Test wall time: 0.30s (debug build, including device init).
-- No H/s yet — single dispatch, no throughput meaning.
+**Numbers.** Release build, 2 000 000-line synthetic dict (`candidate-1` … `candidate-2000000`), 10 targets from `examples/sample_hashes.txt`, zero expected matches:
+
+| Backend | Elapsed | Rate |
+| --- | --- | --- |
+| CPU (single-thread `md-5`) | 0.69 s | **~2.91 MH/s** |
+| GPU (Intel UHD Graphics, Vulkan, this code) | 0.31 s | **~6.44 MH/s** |
+
+CPU number is up from 1.67 MH/s in the Phase 1 entry — that earlier measurement was on a 100 k dict where process-startup tax was a much larger fraction. The 2 M result is the steadier number to anchor against.
+
+Correctness: `cargo run -p gpuhash-cli -- attack --algo md5 --hashes examples/sample_hashes.txt --wordlist examples/tiny_dict.txt --i-own-these-hashes --gpu` finds the same 10 matches as the CPU path. With 10 candidates fitting in one batch, the match order is deterministic for this case; larger batches won't be (matches arrive in atomic-counter-order, not candidate-index order).
 
 **Next.**
-- Phase 3: port MD5 to WGSL. `gpu/shaders/md5.wgsl` with the 64 round constants. `gpu/pipeline.rs` for layout + compute pipeline (build once, reuse). `gpu/buffers.rs` for candidate/target/output buffers (allocate once per run, never `MAP_READ` the hot path). Wire `--gpu` flag into the CLI; cross-check matches against the Phase 1 CPU prototype on the same input before trusting any throughput number.
+- Phase 4: scheduler + on-GPU bruteforce. Ring buffer of staging buffers with `max_in_flight = 2` so dispatch N+1 starts before dispatch N's readback finishes. Move bruteforce candidate generation into the shader (derived from `gid.x` against a mask). Expect this to be where the GPU finally pulls 1–2 orders of magnitude ahead. CLAUDE.md target: `batch_size = 1<<16`, workgroup 32 vs 64 sweep.
 
 ---
