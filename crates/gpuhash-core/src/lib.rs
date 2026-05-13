@@ -12,11 +12,10 @@ pub mod digest;
 pub mod engine;
 pub mod error;
 pub mod event;
+pub mod gpu;
 pub mod hash;
 pub mod loader;
 
-// Phase 2/3 GPU module:
-// pub mod gpu;
 // Phase 4+ scheduler / benchmark / session modules:
 // pub mod scheduler;
 // pub mod benchmark;
