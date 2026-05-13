@@ -20,7 +20,14 @@ use wgpu::util::DeviceExt;
 use crate::gpu::buffers::{CandidateSlot, MatchRecord, Params};
 use crate::{Error, Result};
 
-const WORKGROUP_SIZE: u32 = 64;
+/// Phase-4 sweep on Intel UHD Graphics (Vulkan) at batch=1<<18 found:
+///   wg=32  → 159 MH/s
+///   wg=64  → 211 MH/s
+///   wg=128 → 235 MH/s
+///   wg=256 → 263 MH/s   ← chosen default
+/// CLAUDE.md's a-priori recommendation was 32/64, which the data didn't support.
+pub const DEFAULT_WORKGROUP_SIZE: u32 = 256;
+pub const ALLOWED_WORKGROUP_SIZES: &[u32] = &[32, 64, 128, 256];
 
 /// Default number of batches kept in flight on the queue. Two is sufficient to
 /// keep an Intel iGPU's command queue non-empty across a readback wait without
@@ -40,6 +47,7 @@ pub struct Md5GpuRunner {
     slots: Vec<SlotBuffers>,
 
     batch_size: u32,
+    workgroup_size: u32,
     max_matches: u32,
     num_targets: u32,
     match_buf_size: u64,
@@ -61,16 +69,24 @@ impl Md5GpuRunner {
     ///
     /// - `targets` — one digest per entry; each must be exactly 16 bytes (MD5).
     /// - `batch_size` — maximum number of candidates per submitted batch.
+    /// - `workgroup_size` — WGSL `@workgroup_size`. Must be in
+    ///   `ALLOWED_WORKGROUP_SIZES`.
     /// - `max_matches` — per-batch capacity of the match-record buffer.
     /// - `max_in_flight` — number of slot buffer sets to allocate (≥ 1).
     pub async fn new(
         targets: &[Vec<u8>],
         batch_size: u32,
+        workgroup_size: u32,
         max_matches: u32,
         max_in_flight: usize,
     ) -> Result<Self> {
         if batch_size == 0 {
             return Err(Error::Gpu("batch_size must be > 0".into()));
+        }
+        if !ALLOWED_WORKGROUP_SIZES.contains(&workgroup_size) {
+            return Err(Error::Gpu(format!(
+                "workgroup_size {workgroup_size} not in {ALLOWED_WORKGROUP_SIZES:?}"
+            )));
         }
         if max_matches == 0 {
             return Err(Error::Gpu("max_matches must be > 0".into()));
@@ -115,10 +131,15 @@ impl Md5GpuRunner {
         // The dict shader is a concatenation of the shared MD5 helpers
         // (constants, round function, target-scan) and the dict-specific bindings
         // + entry point. WGSL has no preprocessor / include — we glue here.
+        // `@workgroup_size(64)` in the source is patched to the requested size.
         let shader_src = format!(
             "{}\n{}",
             include_str!("shaders/md5_common.wgsl"),
             include_str!("shaders/md5_dict.wgsl"),
+        );
+        let shader_src = shader_src.replace(
+            "@workgroup_size(64)",
+            &format!("@workgroup_size({workgroup_size})"),
         );
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("md5-dict"),
@@ -221,6 +242,7 @@ impl Md5GpuRunner {
             targets_buf,
             slots,
             batch_size,
+            workgroup_size,
             max_matches,
             num_targets: targets.len() as u32,
             match_buf_size,
@@ -269,7 +291,7 @@ impl Md5GpuRunner {
         self.queue
             .write_buffer(&s.params_buf, 0, bytemuck::bytes_of(&params));
 
-        let workgroups = candidates.len().div_ceil(WORKGROUP_SIZE as usize) as u32;
+        let workgroups = candidates.len().div_ceil(self.workgroup_size as usize) as u32;
 
         let mut enc = self
             .device
@@ -355,6 +377,10 @@ impl Md5GpuRunner {
         self.batch_size
     }
 
+    pub fn workgroup_size(&self) -> u32 {
+        self.workgroup_size
+    }
+
     pub fn max_in_flight(&self) -> usize {
         self.slots.len()
     }
@@ -392,9 +418,15 @@ mod tests {
             .map(|i| digest(Algorithm::Md5, i).unwrap())
             .collect();
 
-        let runner = Md5GpuRunner::new(&targets, 64, 64, DEFAULT_MAX_IN_FLIGHT)
-            .await
-            .expect("runner construction should succeed");
+        let runner = Md5GpuRunner::new(
+            &targets,
+            64,
+            DEFAULT_WORKGROUP_SIZE,
+            64,
+            DEFAULT_MAX_IN_FLIGHT,
+        )
+        .await
+        .expect("runner construction should succeed");
 
         let slots: Vec<CandidateSlot> = inputs
             .iter()
@@ -421,7 +453,7 @@ mod tests {
         let _ = tracing_subscriber::fmt().with_test_writer().try_init();
 
         let bogus_target: Vec<u8> = (0u8..16).collect();
-        let runner = Md5GpuRunner::new(&[bogus_target], 16, 8, 1)
+        let runner = Md5GpuRunner::new(&[bogus_target], 16, DEFAULT_WORKGROUP_SIZE, 8, 1)
             .await
             .expect("runner ok");
 
@@ -449,7 +481,7 @@ mod tests {
             all_targets.push(digest(Algorithm::Md5, input).unwrap());
         }
 
-        let runner = Md5GpuRunner::new(&all_targets, 32, 32, 2)
+        let runner = Md5GpuRunner::new(&all_targets, 32, DEFAULT_WORKGROUP_SIZE, 32, 2)
             .await
             .expect("runner ok");
 

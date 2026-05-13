@@ -22,7 +22,7 @@ pub mod mask;
 // pub mod benchmark;
 // pub mod session;
 
-pub use config::{AttackConfig, AttackMode, Backend};
+pub use config::{AttackConfig, AttackMode, Backend, GpuTuning};
 pub use engine::{Engine, RunningAttack};
 pub use error::{Error, Result};
 pub use event::{AttackSummary, EngineEvent};

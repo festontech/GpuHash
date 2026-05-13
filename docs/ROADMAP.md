@@ -65,11 +65,11 @@ Mark a phase complete by checking its top-level box and adding a logbook entry s
 
 **Goal.** Ring buffer of staging buffers, overlapped dispatches, brute-force on-GPU candidate generation. Expect 5–20× speedup over Phase 3 on Intel iGPU.
 
-- [ ] `Scheduler` with `max_in_flight = 2` ring of staging buffers.
-- [ ] On-GPU brute-force candidate derivation from `gid.x`.
-- [ ] Tune `batch_size` (start at `1<<16` on iGPU; sweep).
-- [ ] Tune `workgroup_size` (32 vs 64).
-- [ ] Logbook: batch / workgroup sweep results, chosen defaults.
+- [x] `Scheduler` with `max_in_flight = 2` ring of staging buffers (per-slot bufs + submit/read split on the runners).
+- [x] On-GPU brute-force candidate derivation from `gid.x` (`md5_bruteforce.wgsl` + `Md5BruteforceRunner` + `crate::mask`).
+- [x] Tune `batch_size` (swept 16384 / 65536 / 262144; **chose 1<<18**).
+- [x] Tune `workgroup_size` (swept 32 / 64 / 128 / 256; **chose 256**).
+- [x] Logbook: batch / workgroup sweep results, chosen defaults.
 
 ---
 

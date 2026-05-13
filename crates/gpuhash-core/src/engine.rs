@@ -34,7 +34,7 @@ use crate::{
     gpu::{
         bruteforce_runner::Md5BruteforceRunner,
         buffers::{CandidateSlot, MAX_CANDIDATE_LEN},
-        runner::{Md5GpuRunner, DEFAULT_MAX_IN_FLIGHT},
+        runner::{Md5GpuRunner, DEFAULT_MAX_IN_FLIGHT, DEFAULT_WORKGROUP_SIZE},
     },
     hash::Algorithm,
     loader::{load_targets, TargetSet},
@@ -42,10 +42,14 @@ use crate::{
     Error, Result,
 };
 
-/// Default GPU batch size when none is otherwise specified. Sized for an Intel
-/// iGPU per the architecture doc: 65 536 candidates × 60-byte slot ≈ 3.75 MB of
-/// device memory for the candidate buffer.
-const DEFAULT_GPU_BATCH: u32 = 1 << 16;
+/// Default GPU batch size when none is otherwise specified.
+///
+/// Phase-4 sweep on Intel UHD Graphics (Vulkan) found 1<<18 to be the throughput
+/// sweet spot at the chosen workgroup size of 256 — see the Phase-4 logbook
+/// entry for the full grid. Total device memory for the bruteforce path is
+/// trivial; the dictionary path holds `batch_size × 60` bytes per slot × 2 slots
+/// = ~31 MB at this default, which is fine on a typical iGPU.
+const DEFAULT_GPU_BATCH: u32 = 1 << 18;
 
 #[derive(Default)]
 pub struct Engine;
@@ -188,11 +192,16 @@ async fn run_gpu_dict(
         total,
     });
 
-    let batch_size = DEFAULT_GPU_BATCH;
+    let batch_size = cfg.gpu_tuning.batch_size.unwrap_or(DEFAULT_GPU_BATCH);
+    let workgroup_size = cfg
+        .gpu_tuning
+        .workgroup_size
+        .unwrap_or(DEFAULT_WORKGROUP_SIZE);
     let max_matches = batch_size;
     let runner = Md5GpuRunner::new(
         &targets.hashes,
         batch_size,
+        workgroup_size,
         max_matches,
         DEFAULT_MAX_IN_FLIGHT,
     )
@@ -322,12 +331,17 @@ async fn run_gpu_bruteforce(
         total: Some(span),
     });
 
-    let batch_size = DEFAULT_GPU_BATCH;
+    let batch_size = cfg.gpu_tuning.batch_size.unwrap_or(DEFAULT_GPU_BATCH);
+    let workgroup_size = cfg
+        .gpu_tuning
+        .workgroup_size
+        .unwrap_or(DEFAULT_WORKGROUP_SIZE);
     let max_matches = batch_size;
     let runner = Md5BruteforceRunner::new(
         &mask,
         &targets.hashes,
         batch_size,
+        workgroup_size,
         max_matches,
         DEFAULT_MAX_IN_FLIGHT,
     )

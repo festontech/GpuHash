@@ -189,3 +189,133 @@ Correctness: `cargo run -p gpuhash-cli -- attack --algo md5 --hashes examples/sa
 - Phase 4: scheduler + on-GPU bruteforce. Ring buffer of staging buffers with `max_in_flight = 2` so dispatch N+1 starts before dispatch N's readback finishes. Move bruteforce candidate generation into the shader (derived from `gid.x` against a mask). Expect this to be where the GPU finally pulls 1–2 orders of magnitude ahead. CLAUDE.md target: `batch_size = 1<<16`, workgroup 32 vs 64 sweep.
 
 ---
+
+## 2026-05-13 — Scheduler + on-GPU bruteforce + tuning (Phase 4)
+
+**Goal today.** Land the three Phase-4 pieces: a 2-deep ring scheduler, on-GPU bruteforce candidate generation, and a workgroup/batch sweep with chosen defaults. CLAUDE.md predicted a 5–20× jump on Intel iGPU; we beat that.
+
+**What I did.** Three commits, each a clean checkpoint:
+
+1. **Scheduler refactor** (`db01675`): split `Md5GpuRunner` into per-slot
+   buffers (`candidates_buf`, `match_buf`, `match_staging`, `params_buf`,
+   `bind_group`) so two batches can be in flight at once on the queue. Old
+   single-step `dispatch_batch` is kept as a convenience for tests. The engine
+   drives a `VecDeque<PendingDictBatch>`: refill up to `max_in_flight`, pop +
+   read the oldest, refill again. Targets and the pipeline are shared across
+   slots.
+
+2. **On-GPU bruteforce** (`c887cce`):
+   - New [crate::mask](../crates/gpuhash-core/src/mask.rs) — hashcat-style
+     parser (`?l`, `?u`, `?d`, literals). `Mask::candidate_at(idx)` is the CPU
+     reference. Refuses keyspaces above `u32::MAX` because the Phase-4 shader
+     indexes in u32.
+   - New `attacks::MaskSource` — CPU bruteforce candidate iterator. Makes
+     `--mask` work on the CPU backend for the first time.
+   - Split `md5.wgsl` into three files concatenated at module-build time with
+     `format!()`: [md5_common.wgsl](../crates/gpuhash-core/src/gpu/shaders/md5_common.wgsl)
+     (K, S, `rotl`, `md5_block`, `scan_targets`, `MatchBuf`, shared `targets`
+     and `match_buf` bindings) +
+     [md5_dict.wgsl](../crates/gpuhash-core/src/gpu/shaders/md5_dict.wgsl) /
+     [md5_bruteforce.wgsl](../crates/gpuhash-core/src/gpu/shaders/md5_bruteforce.wgsl)
+     (per-mode candidate input and entry point).
+   - New
+     [gpu/bruteforce_runner.rs](../crates/gpuhash-core/src/gpu/bruteforce_runner.rs)
+     with `Md5BruteforceRunner`. Same slot/ring discipline; only the mask spec
+     and a 32-bit `base_index` travel host→device per batch (no candidate
+     bytes).
+   - `engine::run_gpu` now dispatches on `AttackMode`: dictionary takes the
+     existing path; bruteforce walks `base_index` over `[start, end)` and
+     reconstructs match plaintexts via `mask.candidate_at(base + idx)`.
+
+3. **Tuning** (this commit): plumbed `batch_size` and `workgroup_size` through
+   `AttackConfig::gpu_tuning` and the CLI's `--gpu-batch` / `--gpu-workgroup`
+   flags. Workgroup-size variation is implemented by substituting
+   `@workgroup_size(64)` in the WGSL source at module-build time (naga's
+   `override` constants would be cleaner — Phase 9 cleanup). Ran the sweep,
+   picked new defaults, updated `DEFAULT_GPU_BATCH = 1 << 18` and
+   `DEFAULT_WORKGROUP_SIZE = 256`.
+
+**What worked.** Both new entry points produced bit-exact agreement with the
+CPU MD5 reference on first try. The shader-splitting via `format!()` glue is
+ugly but contained — once we add SHA-1/SHA-256 in Phase 5 the `_common.wgsl`
+file will pay rent. The slot ring is invisible at the engine level: the
+`PendingDictBatch` / `PendingBruteBatch` VecDeque keeps the bookkeeping local.
+
+**What didn't / surprises.**
+- **Scheduler alone did almost nothing for the dictionary path.** The 2M
+  synthetic-dict benchmark showed ~5.8 MH/s with the scheduler vs ~6.4 MH/s in
+  Phase 3 — within run-to-run noise. Reason: dict mode is host-bound. Each
+  batch the CPU reads 65k lines, allocates 65k `String`s, packs them into
+  60-byte slots. The GPU finishes that work faster than the CPU can keep up.
+  The scheduler's win materializes only once the GPU is the bottleneck.
+- **CLAUDE.md's a-priori workgroup recommendation (32–64) wasn't right** for
+  this hardware. The sweep shows `wg=256` wins decisively at every batch size
+  ≥ 65536. Likely: Intel UHD's compute units prefer fat SIMD waves over many
+  thin ones for this kind of register-light, branch-heavy integer workload.
+- **Run-to-run variance is wide on cold-vs-warm GPU.** A fresh
+  `gpuhash.exe` invocation lands around 125–145 MH/s; back-to-back warm runs
+  occasionally hit 260–375 MH/s. Likely a mix of driver shader caching, GPU
+  clock state, and Windows scheduling. Future Phase 9 thermal-aware sustained
+  benchmark will need to control for warmup.
+- **Match-buffer sizing on dict mode at the new default.** `max_matches =
+  batch_size = 262144`. With 2 slots that's `2 × (16 + 8 × 262144) = ~4 MB`
+  for match buffers alone. Plus candidate buffers at `2 × 262144 × 60` =
+  ~31 MB. Comfortably fits Intel UHD's allocation.
+- **WGSL bit of friction.** Substituting `@workgroup_size(64)` in the shader
+  source as a literal string works, but a one-letter typo would silently leave
+  the default. Acceptable for now; `override workgroup_size: u32 = 64u;` would
+  be a stronger contract — Phase 9 cleanup.
+
+**Decisions made.**
+- **Two separate runner types** (`Md5GpuRunner` and `Md5BruteforceRunner`)
+  rather than one runner with a mode flag. The bind-group layouts differ
+  (binding 0 is `candidates` vs `mask`), so a single pipeline can't serve
+  both. With Phase 5's SHA-1/SHA-256 coming, the right factoring becomes a
+  `HashKernel` trait that owns the per-algo shader code; revisiting then.
+- **`@serde(default)` on `GpuTuning`** so older session JSONs still parse.
+- **u32 candidate index, refused at parse time.** Larger keyspaces (?l^7 ≈
+  8 B) need either u64 indices in the shader (manual 64-bit math; ugly but
+  doable) or a host-side `start`/`end` range driving multiple sub-runs (the
+  CLI already supports `start`/`end` on `AttackMode::Bruteforce`, just not
+  wired through yet). Document and move on.
+- **No CPU rayon yet.** Roadmap had rayon flagged for Phase 4 in the dep
+  list. Holding off: dict mode is host-bound on I/O + allocation, not on
+  hashing per se, so a parallel CPU loop would only modestly help, and the
+  user-facing event channel needs single-producer semantics. Phase 9 cleanup.
+
+**Numbers.** Sweep on Intel UHD Graphics (Vulkan), release build,
+`?l^6` = 308 915 776 candidates, 10 targets from `examples/sample_hashes.txt`,
+single sequential run of the grid (`--gpu-batch N --gpu-workgroup W`):
+
+| workgroup \ batch |    16 384 |    65 536 |    262 144 |
+| ---:              |   ------: |   ------: |    ------: |
+| 32                |  24.6 MH/s |  71.8 MH/s | 159.1 MH/s |
+| 64                |  20.1 MH/s |  77.0 MH/s | 211.1 MH/s |
+| 128               |  15.5 MH/s | 122.3 MH/s | 235.1 MH/s |
+| **256**           |  15.5 MH/s | 148.6 MH/s | **263.3 MH/s** |
+
+Cold-vs-warm variance at the chosen defaults (`wg=256, batch=1<<18`,
+`?l^6`, fresh process each run): **125–375 MH/s** depending on whether the
+GPU was already warm. Steady-state real-world expectation: ~140 MH/s.
+
+Stacked against earlier baselines:
+
+| Phase / config                          | Rate         | Speedup vs Phase-1 CPU |
+| ---                                     |     ---:     | ---:                   |
+| Phase 1 — CPU single-thread             |  ~2.9 MH/s   | 1×                     |
+| Phase 3 — GPU dict (host-bound)         |  ~6.4 MH/s   | 2.2×                   |
+| Phase 4 — GPU brute, old defaults (64/1<<16) | ~54 MH/s | 18.5×                  |
+| Phase 4 — GPU brute, **new defaults (256/1<<18)** | **~140 MH/s steady, peaks to 375 MH/s** | **48× steady, peaks to 129×** |
+
+Correctness untouched: dict mode still finds all 10/10 on the canonical
+example; bruteforce found admin / hello / dragon / monkey / qwerty from
+`sample_hashes.txt` while sweeping ?l^6.
+
+**Next.**
+- Phase 5: SHA-1 and SHA-256. The `md5_common.wgsl` split anticipates the
+  shape — `sha1_common.wgsl` / `sha256_common.wgsl` with their own round
+  functions, plus per-algorithm `*_dict.wgsl` / `*_bruteforce.wgsl`. NIST test
+  vectors as inline tests, on both CPU and GPU paths. `gpuhash benchmark` CLI
+  surface starts mattering once we have three algorithms to compare.
+
+---

@@ -16,9 +16,25 @@ pub struct AttackConfig {
     /// session files written before Phase 3 still load.
     #[serde(default)]
     pub backend: Backend,
+    /// GPU tuning knobs (Phase 4+). When fields are `None`, the engine picks
+    /// the iGPU-tuned defaults from `docs/ARCHITECTURE.md`.
+    #[serde(default)]
+    pub gpu_tuning: GpuTuning,
     /// Optional name for save/resume. If set, the engine persists progress under
     /// `<sessions_dir>/<session_name>.session.json`.
     pub session_name: Option<String>,
+}
+
+/// GPU-side tuning parameters. Overrides the engine's iGPU defaults when set.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GpuTuning {
+    /// Candidates per dispatch. Default 1<<16 (65 536).
+    #[serde(default)]
+    pub batch_size: Option<u32>,
+    /// WGSL `@workgroup_size`. Must be one of the kernel-supported sizes
+    /// (32, 64, 128, 256). Default 64.
+    #[serde(default)]
+    pub workgroup_size: Option<u32>,
 }
 
 /// Which compute path the engine should drive a run on.

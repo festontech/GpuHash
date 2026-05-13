@@ -15,7 +15,7 @@ use crate::gpu::buffers::{BruteforceParams, MaskPosGpu, MatchRecord};
 use crate::mask::{Mask, Position, MAX_MASK_POSITIONS};
 use crate::{Error, Result};
 
-const WORKGROUP_SIZE: u32 = 64;
+use crate::gpu::runner::ALLOWED_WORKGROUP_SIZES;
 
 pub struct Md5BruteforceRunner {
     device: wgpu::Device,
@@ -28,6 +28,7 @@ pub struct Md5BruteforceRunner {
     slots: Vec<SlotBuffers>,
 
     batch_size: u32,
+    workgroup_size: u32,
     max_matches: u32,
     num_targets: u32,
     num_positions: u32,
@@ -60,11 +61,17 @@ impl Md5BruteforceRunner {
         mask: &Mask,
         targets: &[Vec<u8>],
         batch_size: u32,
+        workgroup_size: u32,
         max_matches: u32,
         max_in_flight: usize,
     ) -> Result<Self> {
         if batch_size == 0 {
             return Err(Error::Gpu("batch_size must be > 0".into()));
+        }
+        if !ALLOWED_WORKGROUP_SIZES.contains(&workgroup_size) {
+            return Err(Error::Gpu(format!(
+                "workgroup_size {workgroup_size} not in {ALLOWED_WORKGROUP_SIZES:?}"
+            )));
         }
         if max_matches == 0 {
             return Err(Error::Gpu("max_matches must be > 0".into()));
@@ -116,6 +123,10 @@ impl Md5BruteforceRunner {
             "{}\n{}",
             include_str!("shaders/md5_common.wgsl"),
             include_str!("shaders/md5_bruteforce.wgsl"),
+        );
+        let shader_src = shader_src.replace(
+            "@workgroup_size(64)",
+            &format!("@workgroup_size({workgroup_size})"),
         );
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("md5-bruteforce"),
@@ -218,6 +229,7 @@ impl Md5BruteforceRunner {
             targets_buf,
             slots,
             batch_size,
+            workgroup_size,
             max_matches,
             num_targets: targets.len() as u32,
             num_positions: mask.num_positions() as u32,
@@ -264,7 +276,7 @@ impl Md5BruteforceRunner {
         self.queue
             .write_buffer(&s.params_buf, 0, bytemuck::bytes_of(&params));
 
-        let workgroups = num_candidates.div_ceil(WORKGROUP_SIZE);
+        let workgroups = num_candidates.div_ceil(self.workgroup_size);
 
         let mut enc = self
             .device
@@ -334,6 +346,10 @@ impl Md5BruteforceRunner {
         self.batch_size
     }
 
+    pub fn workgroup_size(&self) -> u32 {
+        self.workgroup_size
+    }
+
     pub fn max_in_flight(&self) -> usize {
         self.slots.len()
     }
@@ -363,7 +379,7 @@ mod tests {
             .map(|p| digest(Algorithm::Md5, p).unwrap())
             .collect();
 
-        let runner = Md5BruteforceRunner::new(&mask, &targets, 1024, 32, DEFAULT_MAX_IN_FLIGHT)
+        let runner = Md5BruteforceRunner::new(&mask, &targets, 1024, 64, 32, DEFAULT_MAX_IN_FLIGHT)
             .await
             .expect("runner ok");
 
@@ -409,7 +425,7 @@ mod tests {
             .map(|p| digest(Algorithm::Md5, p).unwrap())
             .collect();
 
-        let runner = Md5BruteforceRunner::new(&mask, &targets, 128, 16, 1)
+        let runner = Md5BruteforceRunner::new(&mask, &targets, 128, 64, 16, 1)
             .await
             .expect("runner ok");
 

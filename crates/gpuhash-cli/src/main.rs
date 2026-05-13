@@ -9,7 +9,7 @@ use std::process::ExitCode;
 
 use anyhow::{bail, Result};
 use clap::{Parser, Subcommand};
-use gpuhash_core::{Algorithm, AttackConfig, AttackMode, Backend, Engine, EngineEvent};
+use gpuhash_core::{Algorithm, AttackConfig, AttackMode, Backend, Engine, EngineEvent, GpuTuning};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -57,6 +57,14 @@ enum Cmd {
         /// Run the audit on the GPU (WGSL via wgpu). MD5 only in Phase 3.
         #[arg(long)]
         gpu: bool,
+
+        /// Override GPU batch size (default 65536 = 1<<16).
+        #[arg(long, value_name = "N")]
+        gpu_batch: Option<u32>,
+
+        /// Override GPU workgroup size (allowed: 32, 64, 128, 256; default 64).
+        #[arg(long, value_name = "N")]
+        gpu_workgroup: Option<u32>,
 
         /// Emit NDJSON `EngineEvent`s on stdout instead of human-readable progress.
         #[arg(long)]
@@ -119,9 +127,24 @@ async fn dispatch(cli: Cli) -> Result<ExitCode> {
             mask,
             session,
             gpu,
+            gpu_batch,
+            gpu_workgroup,
             json,
             i_own_these_hashes: true,
-        } => run_attack(algo, hashes, wordlist, mask, session, gpu, json).await,
+        } => {
+            run_attack(
+                algo,
+                hashes,
+                wordlist,
+                mask,
+                session,
+                gpu,
+                gpu_batch,
+                gpu_workgroup,
+                json,
+            )
+            .await
+        }
 
         Cmd::Benchmark { .. } => {
             bail!("benchmark: not yet implemented (lands in Phase 2+)");
@@ -129,6 +152,7 @@ async fn dispatch(cli: Cli) -> Result<ExitCode> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_attack(
     algo: Algorithm,
     hashes: PathBuf,
@@ -136,6 +160,8 @@ async fn run_attack(
     mask: Option<String>,
     session_name: Option<String>,
     gpu: bool,
+    gpu_batch: Option<u32>,
+    gpu_workgroup: Option<u32>,
     json: bool,
 ) -> Result<ExitCode> {
     let mode = match (wordlist, mask) {
@@ -154,6 +180,10 @@ async fn run_attack(
         hashes_path: hashes,
         mode,
         backend: if gpu { Backend::Gpu } else { Backend::Cpu },
+        gpu_tuning: GpuTuning {
+            batch_size: gpu_batch,
+            workgroup_size: gpu_workgroup,
+        },
         session_name,
     };
 
