@@ -1,26 +1,11 @@
-// Shared MD5 helpers and result-channel bindings for both the dictionary and
-// bruteforce attack kernels.
-//
-// Conventions:
-//   @group(0) @binding(1)  targets (storage, read)
-//   @group(0) @binding(2)  match_buf (storage, read_write)
-//
-// Per-kernel bindings (candidates / mask, params) sit at @binding 0 and
-// @binding 3 in the dict/brute-specific .wgsl files that follow this one.
-
-struct MatchBuf {
-    count: atomic<u32>,
-    _pad:  array<u32, 3>,
-    pairs: array<u32>,
-}
-
-@group(0) @binding(1) var<storage, read>       targets:   array<u32>;
-@group(0) @binding(2) var<storage, read_write> match_buf: MatchBuf;
+// MD5 per-algorithm pieces: round constants, the block function, and the
+// target-scan helper. Depends on `match_common.wgsl` for `targets`, `match_buf`,
+// `rotl`, and the `MatchBuf` struct.
 
 // MD5 round constants: K[i] = floor(abs(sin(i + 1)) * 2^32) for i in 0..64.
 // `var<private>` allows dynamic indexing inside the kernel (naga rejects this
 // for `const` arrays).
-var<private> K: array<u32, 64> = array<u32, 64>(
+var<private> K_MD5: array<u32, 64> = array<u32, 64>(
     0xd76aa478u, 0xe8c7b756u, 0x242070dbu, 0xc1bdceeeu,
     0xf57c0fafu, 0x4787c62au, 0xa8304613u, 0xfd469501u,
     0x698098d8u, 0x8b44f7afu, 0xffff5bb1u, 0x895cd7beu,
@@ -39,28 +24,21 @@ var<private> K: array<u32, 64> = array<u32, 64>(
     0xf7537e82u, 0xbd3af235u, 0x2ad7d2bbu, 0xeb86d391u,
 );
 
-// Per-round left-rotate amounts.
-var<private> S: array<u32, 64> = array<u32, 64>(
+var<private> S_MD5: array<u32, 64> = array<u32, 64>(
     7u, 12u, 17u, 22u,  7u, 12u, 17u, 22u,  7u, 12u, 17u, 22u,  7u, 12u, 17u, 22u,
     5u,  9u, 14u, 20u,  5u,  9u, 14u, 20u,  5u,  9u, 14u, 20u,  5u,  9u, 14u, 20u,
     4u, 11u, 16u, 23u,  4u, 11u, 16u, 23u,  4u, 11u, 16u, 23u,  4u, 11u, 16u, 23u,
     6u, 10u, 15u, 21u,  6u, 10u, 15u, 21u,  6u, 10u, 15u, 21u,  6u, 10u, 15u, 21u,
 );
 
-fn rotl(x: u32, n: u32) -> u32 {
-    return (x << n) | (x >> (32u - n));
-}
-
-// Compute MD5 over a single 64-byte block. Caller must have already done the
-// 0x80 marker and bit-length padding inside `m`. Returns the four state words
-// as a vec4 (A, B, C, D).
+// Compute MD5 over a 64-byte block already padded by the caller. Returns the
+// four little-endian state words.
 fn md5_block(m_in: array<u32, 16>) -> vec4<u32> {
     var m = m_in;
     var a: u32 = 0x67452301u;
     var b: u32 = 0xefcdab89u;
     var c: u32 = 0x98badcfeu;
     var d: u32 = 0x10325476u;
-
     let a0 = a;
     let b0 = b;
     let c0 = c;
@@ -85,16 +63,28 @@ fn md5_block(m_in: array<u32, 16>) -> vec4<u32> {
         let temp = d;
         d = c;
         c = b;
-        b = b + rotl(a + f + K[i] + m[g], S[i]);
+        b = b + rotl(a + f + K_MD5[i] + m[g], S_MD5[i]);
         a = temp;
     }
 
     return vec4<u32>(a + a0, b + b0, c + c0, d + d0);
 }
 
-// Compare a computed digest against the entire target list; on a hit, reserve
-// a slot in the match buffer.
-fn scan_targets(h: vec4<u32>, cand_idx: u32, num_targets: u32, max_matches: u32) {
+// Append the 0x80 marker at byte `len` and the 64-bit length in bits to the
+// MD5 working block (little-endian within each word).
+fn md5_pad_block(M_in: array<u32, 16>, len: u32) -> array<u32, 16> {
+    var M = M_in;
+    let word_idx = len >> 2u;
+    let byte_off = (len & 3u) << 3u;
+    M[word_idx] = M[word_idx] | (0x80u << byte_off);
+    M[14] = len << 3u;
+    M[15] = 0u;
+    return M;
+}
+
+// Compare a 4-word MD5 digest against the target list; on hit, reserve a slot
+// in match_buf.
+fn scan_targets_md5(h: vec4<u32>, cand_idx: u32, num_targets: u32, max_matches: u32) {
     for (var t = 0u; t < num_targets; t = t + 1u) {
         let base = t * 4u;
         if (h.x == targets[base]

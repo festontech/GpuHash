@@ -6,8 +6,10 @@
 //!   computes MD5 per slot and compares against the target list, and matches are
 //!   read back via a small staging buffer.
 
+pub mod algos;
 pub mod bruteforce_runner;
 pub mod buffers;
+pub mod kernel_spec;
 pub mod runner;
 
 use bytemuck;

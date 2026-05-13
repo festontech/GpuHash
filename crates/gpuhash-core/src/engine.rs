@@ -32,9 +32,11 @@ use crate::{
     digest::digest,
     event::{AttackSummary, EngineEvent},
     gpu::{
-        bruteforce_runner::Md5BruteforceRunner,
+        algos::{md5 as md5_kernel, sha1 as sha1_kernel},
+        bruteforce_runner::BruteforceRunner,
         buffers::{CandidateSlot, MAX_CANDIDATE_LEN},
-        runner::{Md5GpuRunner, DEFAULT_MAX_IN_FLIGHT, DEFAULT_WORKGROUP_SIZE},
+        kernel_spec::{BruteforceKernelSpec, DictKernelSpec},
+        runner::{DictRunner, DEFAULT_MAX_IN_FLIGHT, DEFAULT_WORKGROUP_SIZE},
     },
     hash::Algorithm,
     loader::{load_targets, TargetSet},
@@ -158,27 +160,32 @@ async fn run_gpu(
     tx: &mpsc::UnboundedSender<EngineEvent>,
     cancel: &CancellationToken,
 ) -> Result<()> {
-    if cfg.algo != Algorithm::Md5 {
-        return Err(Error::NotImplemented(
-            "GPU backend currently supports md5 only (sha1/sha256 land in Phase 5)",
-        ));
-    }
+    let (dict_spec, brute_spec) = match cfg.algo {
+        Algorithm::Md5 => (md5_kernel::DICT_SPEC, md5_kernel::BRUTE_SPEC),
+        Algorithm::Sha1 => (sha1_kernel::DICT_SPEC, sha1_kernel::BRUTE_SPEC),
+        Algorithm::Sha256 => {
+            return Err(Error::NotImplemented(
+                "GPU SHA-256 lands in the next Phase 5 commit",
+            ));
+        }
+    };
 
     let targets: TargetSet = load_targets(&cfg.hashes_path, cfg.algo)?;
 
     match &cfg.mode {
-        AttackMode::Dictionary { .. } => run_gpu_dict(&cfg, &targets, tx, cancel).await,
+        AttackMode::Dictionary { .. } => run_gpu_dict(dict_spec, &cfg, &targets, tx, cancel).await,
         AttackMode::Bruteforce { mask, start, end } => {
             let parsed = Mask::parse(mask).map_err(Error::BadFormat)?;
             let total = parsed.total();
             let start = *start;
             let end = end.unwrap_or(total);
-            run_gpu_bruteforce(&cfg, &targets, parsed, start, end, tx, cancel).await
+            run_gpu_bruteforce(brute_spec, &cfg, &targets, parsed, start, end, tx, cancel).await
         }
     }
 }
 
 async fn run_gpu_dict(
+    spec: DictKernelSpec,
     cfg: &AttackConfig,
     targets: &TargetSet,
     tx: &mpsc::UnboundedSender<EngineEvent>,
@@ -198,7 +205,8 @@ async fn run_gpu_dict(
         .workgroup_size
         .unwrap_or(DEFAULT_WORKGROUP_SIZE);
     let max_matches = batch_size;
-    let runner = Md5GpuRunner::new(
+    let runner = DictRunner::new(
+        spec,
         &targets.hashes,
         batch_size,
         workgroup_size,
@@ -297,7 +305,9 @@ async fn run_gpu_dict(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_gpu_bruteforce(
+    spec: BruteforceKernelSpec,
     cfg: &AttackConfig,
     targets: &TargetSet,
     mask: Mask,
@@ -337,7 +347,8 @@ async fn run_gpu_bruteforce(
         .workgroup_size
         .unwrap_or(DEFAULT_WORKGROUP_SIZE);
     let max_matches = batch_size;
-    let runner = Md5BruteforceRunner::new(
+    let runner = BruteforceRunner::new(
+        spec,
         &mask,
         &targets.hashes,
         batch_size,

@@ -1,23 +1,24 @@
-//! `Md5BruteforceRunner` — GPU mask-bruteforce equivalent of `Md5GpuRunner`.
+//! `BruteforceRunner` — GPU mask-bruteforce runner, generic over the hash
+//! algorithm via [`BruteforceKernelSpec`].
 //!
 //! The mask and the target list are uploaded once at construction; each batch
 //! only changes `base_index` (and the number of candidates in the trailing
 //! batch). Candidate bytes are not transferred — each thread synthesizes its
 //! own from `base_index + gid.x` against the per-position mask spec.
 //!
-//! Same slot/ring discipline as `Md5GpuRunner`: per-slot params/match/staging
+//! Same slot/ring discipline as `DictRunner`: per-slot params/match/staging
 //! buffers + bind group; mask, targets, and pipeline are shared.
 
 use bytemuck;
 use wgpu::util::DeviceExt;
 
 use crate::gpu::buffers::{BruteforceParams, MaskPosGpu, MatchRecord};
+use crate::gpu::kernel_spec::{pack_target_words, BruteforceKernelSpec};
+use crate::gpu::runner::ALLOWED_WORKGROUP_SIZES;
 use crate::mask::{Mask, Position, MAX_MASK_POSITIONS};
 use crate::{Error, Result};
 
-use crate::gpu::runner::ALLOWED_WORKGROUP_SIZES;
-
-pub struct Md5BruteforceRunner {
+pub struct BruteforceRunner {
     device: wgpu::Device,
     queue: wgpu::Queue,
     pipeline: wgpu::ComputePipeline,
@@ -56,8 +57,9 @@ pub fn mask_to_gpu_positions(mask: &Mask) -> Vec<MaskPosGpu> {
         .collect()
 }
 
-impl Md5BruteforceRunner {
+impl BruteforceRunner {
     pub async fn new(
+        spec: BruteforceKernelSpec,
         mask: &Mask,
         targets: &[Vec<u8>],
         batch_size: u32,
@@ -83,10 +85,12 @@ impl Md5BruteforceRunner {
             return Err(Error::Gpu("at least one target hash required".into()));
         }
         for (i, t) in targets.iter().enumerate() {
-            if t.len() != 16 {
+            if t.len() != spec.digest_bytes {
                 return Err(Error::Gpu(format!(
-                    "target {i} is {} bytes, expected 16 (MD5)",
-                    t.len()
+                    "target {i} is {} bytes, expected {} for {}",
+                    t.len(),
+                    spec.digest_bytes,
+                    spec.pipeline_label,
                 )));
             }
         }
@@ -109,8 +113,10 @@ impl Md5BruteforceRunner {
             driver_info = %info.driver_info,
             max_in_flight,
             batch_size,
+            workgroup_size,
             mask = %mask,
-            "md5 bruteforce runner: adapter selected"
+            label = spec.pipeline_label,
+            "bruteforce runner: adapter selected"
         );
 
         let (device, queue) = adapter
@@ -118,25 +124,20 @@ impl Md5BruteforceRunner {
             .await
             .map_err(|e| Error::Gpu(format!("request_device: {e}")))?;
 
-        // ---- pipeline (shared common helpers + brute entry point) ----
-        let shader_src = format!(
-            "{}\n{}",
-            include_str!("shaders/md5_common.wgsl"),
-            include_str!("shaders/md5_bruteforce.wgsl"),
-        );
-        let shader_src = shader_src.replace(
+        // ---- pipeline ----
+        let shader_src = spec.assemble_shader().replace(
             "@workgroup_size(64)",
             &format!("@workgroup_size({workgroup_size})"),
         );
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("md5-bruteforce"),
+            label: Some(spec.pipeline_label),
             source: wgpu::ShaderSource::Wgsl(shader_src.into()),
         });
         let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("md5-bruteforce-pipeline"),
+            label: Some(spec.pipeline_label),
             layout: None,
             module: &module,
-            entry_point: "md5_bruteforce",
+            entry_point: spec.entry_point,
             compilation_options: Default::default(),
             cache: None,
         });
@@ -145,24 +146,15 @@ impl Md5BruteforceRunner {
         // ---- shared mask buffer ----
         let mask_positions = mask_to_gpu_positions(mask);
         let mask_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("md5-bruteforce-mask"),
+            label: Some(&format!("{}-mask", spec.pipeline_label)),
             contents: bytemuck::cast_slice(&mask_positions),
             usage: wgpu::BufferUsages::STORAGE,
         });
 
         // ---- shared targets buffer ----
-        let target_words: Vec<u32> = targets
-            .iter()
-            .flat_map(|t| {
-                let mut words = [0u32; 4];
-                for (i, chunk) in t.chunks_exact(4).enumerate() {
-                    words[i] = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
-                }
-                words
-            })
-            .collect();
+        let target_words = pack_target_words(targets, spec.digest_bytes, spec.target_endian);
         let targets_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("md5-bruteforce-targets"),
+            label: Some(&format!("{}-targets", spec.pipeline_label)),
             contents: bytemuck::cast_slice(&target_words),
             usage: wgpu::BufferUsages::STORAGE,
         });
@@ -172,7 +164,7 @@ impl Md5BruteforceRunner {
         let mut slots = Vec::with_capacity(max_in_flight);
         for slot_idx in 0..max_in_flight {
             let match_buf = device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some(&format!("md5-brute-match-{slot_idx}")),
+                label: Some(&format!("{}-match-{slot_idx}", spec.pipeline_label)),
                 size: match_buf_size,
                 usage: wgpu::BufferUsages::STORAGE
                     | wgpu::BufferUsages::COPY_DST
@@ -180,19 +172,19 @@ impl Md5BruteforceRunner {
                 mapped_at_creation: false,
             });
             let match_staging = device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some(&format!("md5-brute-match-staging-{slot_idx}")),
+                label: Some(&format!("{}-staging-{slot_idx}", spec.pipeline_label)),
                 size: match_buf_size,
                 usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             });
             let params_buf = device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some(&format!("md5-brute-params-{slot_idx}")),
+                label: Some(&format!("{}-params-{slot_idx}", spec.pipeline_label)),
                 size: std::mem::size_of::<BruteforceParams>() as u64,
                 usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             });
             let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some(&format!("md5-brute-bind-{slot_idx}")),
+                label: Some(&format!("{}-bind-{slot_idx}", spec.pipeline_label)),
                 layout: &bgl,
                 entries: &[
                     wgpu::BindGroupEntry {
@@ -237,9 +229,6 @@ impl Md5BruteforceRunner {
         })
     }
 
-    /// Submit a batch covering `num_candidates` candidate indices starting at
-    /// `base_index`. Pair every successful `submit` with a `read_matches` on the
-    /// same slot before reusing it.
     pub fn submit(&self, slot: usize, base_index: u32, num_candidates: u32) -> Result<()> {
         if slot >= self.slots.len() {
             return Err(Error::Gpu(format!(
@@ -258,7 +247,6 @@ impl Md5BruteforceRunner {
         }
         let s = &self.slots[slot];
 
-        // Zero match-buffer header.
         let header_zero = [0u32; 4];
         self.queue
             .write_buffer(&s.match_buf, 0, bytemuck::cast_slice(&header_zero));
@@ -281,11 +269,11 @@ impl Md5BruteforceRunner {
         let mut enc = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("md5-brute-encoder"),
+                label: Some("brute-batch-encoder"),
             });
         {
             let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("md5-brute-pass"),
+                label: Some("brute-batch-pass"),
                 timestamp_writes: None,
             });
             pass.set_pipeline(&self.pipeline);
@@ -297,7 +285,6 @@ impl Md5BruteforceRunner {
         Ok(())
     }
 
-    /// Read back the match records produced by the most recent submit on `slot`.
     pub async fn read_matches(&self, slot: usize) -> Result<Vec<MatchRecord>> {
         if slot >= self.slots.len() {
             return Err(Error::Gpu(format!(
@@ -333,7 +320,7 @@ impl Md5BruteforceRunner {
                 tracing::warn!(
                     found = count,
                     capacity = self.max_matches,
-                    "md5 brute batch produced more matches than capacity; tail dropped"
+                    "brute batch produced more matches than capacity; tail dropped"
                 );
             }
             out
@@ -359,12 +346,11 @@ impl Md5BruteforceRunner {
 mod tests {
     use super::*;
     use crate::digest::digest;
+    use crate::gpu::algos::{md5 as md5_kernel, sha1 as sha1_kernel};
     use crate::gpu::runner::DEFAULT_MAX_IN_FLIGHT;
     use crate::Algorithm;
 
-    #[tokio::test]
-    async fn md5_brute_matches_cpu_reference() {
-        // Mask "?d?d?d" → 1000 candidates. Pick four that we know exist.
+    async fn assert_brute_matches_cpu(algo: Algorithm, spec: BruteforceKernelSpec) {
         let _ = tracing_subscriber::fmt().with_test_writer().try_init();
 
         let mask = Mask::parse("?d?d?d").unwrap();
@@ -374,23 +360,16 @@ mod tests {
             b"999".to_vec(),
             b"042".to_vec(),
         ];
-        let targets: Vec<Vec<u8>> = pick
-            .iter()
-            .map(|p| digest(Algorithm::Md5, p).unwrap())
-            .collect();
+        let targets: Vec<Vec<u8>> = pick.iter().map(|p| digest(algo, p).unwrap()).collect();
 
-        let runner = Md5BruteforceRunner::new(&mask, &targets, 1024, 64, 32, DEFAULT_MAX_IN_FLIGHT)
-            .await
-            .expect("runner ok");
+        let runner =
+            BruteforceRunner::new(spec, &mask, &targets, 1024, 64, 32, DEFAULT_MAX_IN_FLIGHT)
+                .await
+                .expect("runner ok");
 
-        // One batch covers the entire 1000-candidate keyspace.
         runner.submit(0, 0, mask.total() as u32).expect("submit ok");
-        let mut matches = runner.read_matches(0).await.expect("read ok");
-        matches.sort_by_key(|m| (m.candidate_idx, m.target_idx));
+        let matches = runner.read_matches(0).await.expect("read ok");
 
-        // Each of our target indices (the 4 we picked) should appear in
-        // matches, with candidate_idx equal to the index of that string in the
-        // mask's keyspace.
         let expected: Vec<(u32, u32)> = pick
             .iter()
             .enumerate()
@@ -403,19 +382,26 @@ mod tests {
             .iter()
             .map(|m| (m.candidate_idx, m.target_idx))
             .collect();
-        // Sort both for comparison.
         let mut e = expected;
         e.sort();
         let mut a = actual;
         a.sort();
-        assert_eq!(a, e, "GPU bruteforce disagrees with CPU expectation");
+        assert_eq!(a, e, "{algo} bruteforce GPU disagrees with CPU");
     }
 
     #[tokio::test]
-    async fn md5_brute_with_literal_position() {
-        // Mask "x?d?d" — candidates "x00".."x99" (100 candidates).
-        let _ = tracing_subscriber::fmt().with_test_writer().try_init();
+    async fn md5_brute_matches_cpu_reference() {
+        assert_brute_matches_cpu(Algorithm::Md5, md5_kernel::BRUTE_SPEC).await;
+    }
 
+    #[tokio::test]
+    async fn sha1_brute_matches_cpu_reference() {
+        assert_brute_matches_cpu(Algorithm::Sha1, sha1_kernel::BRUTE_SPEC).await;
+    }
+
+    #[tokio::test]
+    async fn brute_with_literal_position() {
+        let _ = tracing_subscriber::fmt().with_test_writer().try_init();
         let mask = Mask::parse("x?d?d").unwrap();
         assert_eq!(mask.total(), 100);
 
@@ -425,7 +411,7 @@ mod tests {
             .map(|p| digest(Algorithm::Md5, p).unwrap())
             .collect();
 
-        let runner = Md5BruteforceRunner::new(&mask, &targets, 128, 64, 16, 1)
+        let runner = BruteforceRunner::new(md5_kernel::BRUTE_SPEC, &mask, &targets, 128, 64, 16, 1)
             .await
             .expect("runner ok");
 

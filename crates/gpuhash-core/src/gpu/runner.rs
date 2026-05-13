@@ -1,14 +1,12 @@
-//! `Md5GpuRunner` — owns the wgpu device, the MD5 pipeline, and per-slot
-//! persistent buffers for overlapped batched dispatches.
+//! `DictRunner` — owns the wgpu device, a dictionary-attack compute pipeline,
+//! and per-slot persistent buffers for overlapped batched dispatches.
 //!
-//! Phase-4 scope: `max_in_flight` "slots" each carry their own
-//! candidate/match/staging buffers, so the engine can submit batch N+1 while
-//! batch N's readback is still pending. The runner exposes a `submit` /
-//! `read_matches` split; the engine drives the ring scheduling. A convenience
-//! `dispatch_batch` keeps the Phase-3 "one batch, await it" form for tests.
+//! Phase-4 introduced the slot/ring discipline; Phase 5 made the runner generic
+//! over the hash algorithm via [`DictKernelSpec`]. The same Rust code drives
+//! MD5, SHA-1, and SHA-256; only the shader source + target packing differ.
 //!
 //! Buffer reuse policy (see `docs/ARCHITECTURE.md` and `CLAUDE.md`):
-//! - Pipelines built once per algorithm.
+//! - Pipeline + bind-group layout built once per runner.
 //! - Per-slot storage buffers allocated once at the batch-size cap and reused.
 //! - The targets buffer is shared across all slots (written once at construction).
 //! - Only the small match-staging buffers are `MAP_READ`. Hot-path buffers never
@@ -18,6 +16,7 @@ use bytemuck;
 use wgpu::util::DeviceExt;
 
 use crate::gpu::buffers::{CandidateSlot, MatchRecord, Params};
+use crate::gpu::kernel_spec::{pack_target_words, DictKernelSpec};
 use crate::{Error, Result};
 
 /// Phase-4 sweep on Intel UHD Graphics (Vulkan) at batch=1<<18 found:
@@ -34,8 +33,9 @@ pub const ALLOWED_WORKGROUP_SIZES: &[u32] = &[32, 64, 128, 256];
 /// inflating device-memory use.
 pub const DEFAULT_MAX_IN_FLIGHT: usize = 2;
 
-/// Owning handle to a GPU MD5 attack runner.
-pub struct Md5GpuRunner {
+/// Generic dictionary-attack runner. The algorithm is selected by the
+/// `DictKernelSpec` passed to [`DictRunner::new`].
+pub struct DictRunner {
     device: wgpu::Device,
     queue: wgpu::Queue,
     pipeline: wgpu::ComputePipeline,
@@ -63,17 +63,19 @@ struct SlotBuffers {
     bind_group: wgpu::BindGroup,
 }
 
-impl Md5GpuRunner {
+impl DictRunner {
     /// Construct a runner targeting the host's preferred GPU adapter and
     /// pre-upload the target hashes.
     ///
-    /// - `targets` — one digest per entry; each must be exactly 16 bytes (MD5).
+    /// - `spec` — algorithm-specific shader and target-layout details.
+    /// - `targets` — one digest per entry; each must be `spec.digest_bytes` bytes.
     /// - `batch_size` — maximum number of candidates per submitted batch.
-    /// - `workgroup_size` — WGSL `@workgroup_size`. Must be in
+    /// - `workgroup_size` — WGSL `@workgroup_size`; must be in
     ///   `ALLOWED_WORKGROUP_SIZES`.
     /// - `max_matches` — per-batch capacity of the match-record buffer.
     /// - `max_in_flight` — number of slot buffer sets to allocate (≥ 1).
     pub async fn new(
+        spec: DictKernelSpec,
         targets: &[Vec<u8>],
         batch_size: u32,
         workgroup_size: u32,
@@ -98,10 +100,12 @@ impl Md5GpuRunner {
             return Err(Error::Gpu("at least one target hash required".into()));
         }
         for (i, t) in targets.iter().enumerate() {
-            if t.len() != 16 {
+            if t.len() != spec.digest_bytes {
                 return Err(Error::Gpu(format!(
-                    "target {i} is {} bytes, expected 16 (MD5)",
-                    t.len()
+                    "target {i} is {} bytes, expected {} for {}",
+                    t.len(),
+                    spec.digest_bytes,
+                    spec.pipeline_label,
                 )));
             }
         }
@@ -119,7 +123,9 @@ impl Md5GpuRunner {
             driver_info = %info.driver_info,
             max_in_flight,
             batch_size,
-            "md5 runner: adapter selected"
+            workgroup_size,
+            label = spec.pipeline_label,
+            "dict runner: adapter selected"
         );
 
         let (device, queue) = adapter
@@ -128,46 +134,30 @@ impl Md5GpuRunner {
             .map_err(|e| Error::Gpu(format!("request_device: {e}")))?;
 
         // ---- pipeline ----
-        // The dict shader is a concatenation of the shared MD5 helpers
-        // (constants, round function, target-scan) and the dict-specific bindings
-        // + entry point. WGSL has no preprocessor / include — we glue here.
-        // `@workgroup_size(64)` in the source is patched to the requested size.
-        let shader_src = format!(
-            "{}\n{}",
-            include_str!("shaders/md5_common.wgsl"),
-            include_str!("shaders/md5_dict.wgsl"),
-        );
-        let shader_src = shader_src.replace(
+        // Assemble the shader from common + algo + entry, then patch the
+        // workgroup size literal.
+        let shader_src = spec.assemble_shader().replace(
             "@workgroup_size(64)",
             &format!("@workgroup_size({workgroup_size})"),
         );
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("md5-dict"),
+            label: Some(spec.pipeline_label),
             source: wgpu::ShaderSource::Wgsl(shader_src.into()),
         });
         let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("md5-pipeline"),
+            label: Some(spec.pipeline_label),
             layout: None,
             module: &module,
-            entry_point: "md5_attack",
+            entry_point: spec.entry_point,
             compilation_options: Default::default(),
             cache: None,
         });
         let bgl = pipeline.get_bind_group_layout(0);
 
         // ---- shared targets buffer ----
-        let target_words: Vec<u32> = targets
-            .iter()
-            .flat_map(|t| {
-                let mut words = [0u32; 4];
-                for (i, chunk) in t.chunks_exact(4).enumerate() {
-                    words[i] = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
-                }
-                words
-            })
-            .collect();
+        let target_words = pack_target_words(targets, spec.digest_bytes, spec.target_endian);
         let targets_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("md5-targets"),
+            label: Some(&format!("{}-targets", spec.pipeline_label)),
             contents: bytemuck::cast_slice(&target_words),
             usage: wgpu::BufferUsages::STORAGE,
         });
@@ -179,13 +169,13 @@ impl Md5GpuRunner {
         let mut slots = Vec::with_capacity(max_in_flight);
         for slot_idx in 0..max_in_flight {
             let candidates_buf = device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some(&format!("md5-candidates-{slot_idx}")),
+                label: Some(&format!("{}-cand-{slot_idx}", spec.pipeline_label)),
                 size: candidates_size,
                 usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             });
             let match_buf = device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some(&format!("md5-match-{slot_idx}")),
+                label: Some(&format!("{}-match-{slot_idx}", spec.pipeline_label)),
                 size: match_buf_size,
                 usage: wgpu::BufferUsages::STORAGE
                     | wgpu::BufferUsages::COPY_DST
@@ -193,19 +183,19 @@ impl Md5GpuRunner {
                 mapped_at_creation: false,
             });
             let match_staging = device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some(&format!("md5-match-staging-{slot_idx}")),
+                label: Some(&format!("{}-staging-{slot_idx}", spec.pipeline_label)),
                 size: match_buf_size,
                 usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             });
             let params_buf = device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some(&format!("md5-params-{slot_idx}")),
+                label: Some(&format!("{}-params-{slot_idx}", spec.pipeline_label)),
                 size: std::mem::size_of::<Params>() as u64,
                 usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             });
             let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some(&format!("md5-bind-group-{slot_idx}")),
+                label: Some(&format!("{}-bind-{slot_idx}", spec.pipeline_label)),
                 layout: &bgl,
                 entries: &[
                     wgpu::BindGroupEntry {
@@ -250,10 +240,6 @@ impl Md5GpuRunner {
     }
 
     /// Submit one batch into `slot` without waiting for results.
-    ///
-    /// `candidates.len()` must be `<= batch_size`. Pair every successful `submit`
-    /// with a corresponding [`Md5GpuRunner::read_matches`] for the same slot
-    /// before submitting into that slot again.
     pub fn submit(&self, slot: usize, candidates: &[CandidateSlot]) -> Result<()> {
         if slot >= self.slots.len() {
             return Err(Error::Gpu(format!(
@@ -276,8 +262,6 @@ impl Md5GpuRunner {
         self.queue
             .write_buffer(&s.candidates_buf, 0, bytemuck::cast_slice(candidates));
 
-        // Zero the match buffer header (count + pad). Pairs beyond the new
-        // count are simply not read.
         let header_zero = [0u32; 4];
         self.queue
             .write_buffer(&s.match_buf, 0, bytemuck::cast_slice(&header_zero));
@@ -296,11 +280,11 @@ impl Md5GpuRunner {
         let mut enc = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("md5-batch-encoder"),
+                label: Some("dict-batch-encoder"),
             });
         {
             let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("md5-batch-pass"),
+                label: Some("dict-batch-pass"),
                 timestamp_writes: None,
             });
             pass.set_pipeline(&self.pipeline);
@@ -327,9 +311,6 @@ impl Md5GpuRunner {
         slice.map_async(wgpu::MapMode::Read, move |r| {
             let _ = tx.send(r);
         });
-        // poll(Wait) drains *all* pending queue work; that's fine for our
-        // scheduler — the other in-flight slots' staging copies finish too,
-        // and a later read_matches on them is then an instant local map.
         self.device.poll(wgpu::Maintain::Wait);
         rx.await
             .map_err(|e| Error::Gpu(format!("map_async sender dropped: {e}")))?
@@ -352,19 +333,16 @@ impl Md5GpuRunner {
                 tracing::warn!(
                     found = count,
                     capacity = self.max_matches,
-                    "md5 batch produced more matches than buffer capacity; tail dropped"
+                    "dict batch produced more matches than capacity; tail dropped"
                 );
             }
             out
         };
         s.match_staging.unmap();
-
         Ok(records)
     }
 
-    /// Convenience: submit + immediately await results. Equivalent to the
-    /// Phase-3 single-batch dispatch flow; primarily used by tests and by
-    /// callers that don't need overlap.
+    /// Convenience: submit + immediately await results.
     pub async fn dispatch_batch(&self, candidates: &[CandidateSlot]) -> Result<Vec<MatchRecord>> {
         if candidates.is_empty() {
             return Ok(Vec::new());
@@ -390,11 +368,13 @@ impl Md5GpuRunner {
 mod tests {
     use super::*;
     use crate::digest::digest;
+    use crate::gpu::algos::{md5 as md5_kernel, sha1 as sha1_kernel};
     use crate::gpu::buffers::CandidateSlot;
     use crate::Algorithm;
 
-    #[tokio::test]
-    async fn md5_gpu_matches_cpu_on_short_inputs() {
+    /// Run a 5-input dict test with the given (algorithm, spec) pair. Asserts
+    /// that GPU matches CPU for every input.
+    async fn assert_dict_matches_cpu(algo: Algorithm, spec: DictKernelSpec) {
         let _ = tracing_subscriber::fmt()
             .with_env_filter(
                 tracing_subscriber::EnvFilter::try_from_default_env()
@@ -403,22 +383,11 @@ mod tests {
             .with_test_writer()
             .try_init();
 
-        let inputs: Vec<&[u8]> = vec![
-            b"",
-            b"a",
-            b"abc",
-            b"password",
-            b"qwerty",
-            b"hello, world",
-            b"message digest",
-            b"abcdefghijklmnopqrstuvwxyz",
-        ];
-        let targets: Vec<Vec<u8>> = inputs
-            .iter()
-            .map(|i| digest(Algorithm::Md5, i).unwrap())
-            .collect();
+        let inputs: Vec<&[u8]> = vec![b"", b"a", b"abc", b"password", b"hello, world"];
+        let targets: Vec<Vec<u8>> = inputs.iter().map(|i| digest(algo, i).unwrap()).collect();
 
-        let runner = Md5GpuRunner::new(
+        let runner = DictRunner::new(
+            spec,
             &targets,
             64,
             DEFAULT_WORKGROUP_SIZE,
@@ -426,18 +395,12 @@ mod tests {
             DEFAULT_MAX_IN_FLIGHT,
         )
         .await
-        .expect("runner construction should succeed");
-
+        .expect("runner construction");
         let slots: Vec<CandidateSlot> = inputs
             .iter()
-            .map(|i| CandidateSlot::pack(i).expect("input fits single-block MD5"))
+            .map(|i| CandidateSlot::pack(i).expect("fits single-block"))
             .collect();
-
-        let mut matches = runner
-            .dispatch_batch(&slots)
-            .await
-            .expect("dispatch should succeed");
-
+        let mut matches = runner.dispatch_batch(&slots).await.expect("dispatch ok");
         matches.sort_by_key(|m| (m.candidate_idx, m.target_idx));
         let expected: Vec<MatchRecord> = (0..inputs.len() as u32)
             .map(|i| MatchRecord {
@@ -445,46 +408,62 @@ mod tests {
                 target_idx: i,
             })
             .collect();
-        assert_eq!(matches, expected, "GPU MD5 disagreed with CPU MD5");
+        assert_eq!(matches, expected, "{algo} GPU disagrees with CPU");
     }
 
     #[tokio::test]
-    async fn md5_gpu_no_match_when_target_absent() {
+    async fn md5_dict_matches_cpu() {
+        assert_dict_matches_cpu(Algorithm::Md5, md5_kernel::DICT_SPEC).await;
+    }
+
+    #[tokio::test]
+    async fn sha1_dict_matches_cpu() {
+        assert_dict_matches_cpu(Algorithm::Sha1, sha1_kernel::DICT_SPEC).await;
+    }
+
+    #[tokio::test]
+    async fn dict_no_match_when_target_absent() {
         let _ = tracing_subscriber::fmt().with_test_writer().try_init();
-
+        // Use MD5 spec; the no-match check is algorithm-independent.
         let bogus_target: Vec<u8> = (0u8..16).collect();
-        let runner = Md5GpuRunner::new(&[bogus_target], 16, DEFAULT_WORKGROUP_SIZE, 8, 1)
-            .await
-            .expect("runner ok");
-
+        let runner = DictRunner::new(
+            md5_kernel::DICT_SPEC,
+            &[bogus_target],
+            16,
+            DEFAULT_WORKGROUP_SIZE,
+            8,
+            1,
+        )
+        .await
+        .expect("runner ok");
         let inputs: Vec<&[u8]> = vec![b"alpha", b"bravo", b"charlie"];
         let slots: Vec<CandidateSlot> = inputs
             .iter()
             .map(|i| CandidateSlot::pack(i).unwrap())
             .collect();
-
         let matches = runner.dispatch_batch(&slots).await.expect("dispatch ok");
         assert!(matches.is_empty(), "unexpected matches: {matches:?}");
     }
 
     #[tokio::test]
-    async fn md5_gpu_two_in_flight_batches() {
-        // Submit two batches into two slots, then read both. Validates that
-        // per-slot buffers don't alias and that read_matches works on a slot
-        // other than 0.
+    async fn dict_two_in_flight_batches() {
         let _ = tracing_subscriber::fmt().with_test_writer().try_init();
-
         let inputs_a: Vec<&[u8]> = vec![b"alpha", b"bravo", b"charlie"];
         let inputs_b: Vec<&[u8]> = vec![b"delta", b"echo", b"foxtrot"];
         let mut all_targets: Vec<Vec<u8>> = Vec::new();
         for input in inputs_a.iter().chain(inputs_b.iter()) {
             all_targets.push(digest(Algorithm::Md5, input).unwrap());
         }
-
-        let runner = Md5GpuRunner::new(&all_targets, 32, DEFAULT_WORKGROUP_SIZE, 32, 2)
-            .await
-            .expect("runner ok");
-
+        let runner = DictRunner::new(
+            md5_kernel::DICT_SPEC,
+            &all_targets,
+            32,
+            DEFAULT_WORKGROUP_SIZE,
+            32,
+            2,
+        )
+        .await
+        .expect("runner ok");
         let slots_a: Vec<CandidateSlot> = inputs_a
             .iter()
             .map(|i| CandidateSlot::pack(i).unwrap())
@@ -494,27 +473,18 @@ mod tests {
             .map(|i| CandidateSlot::pack(i).unwrap())
             .collect();
 
-        runner.submit(0, &slots_a).expect("submit slot 0");
-        runner.submit(1, &slots_b).expect("submit slot 1");
+        runner.submit(0, &slots_a).expect("submit 0");
+        runner.submit(1, &slots_b).expect("submit 1");
+        let matches_a = runner.read_matches(0).await.expect("read 0");
+        let matches_b = runner.read_matches(1).await.expect("read 1");
 
-        let matches_a = runner.read_matches(0).await.expect("read slot 0");
-        let matches_b = runner.read_matches(1).await.expect("read slot 1");
-
-        // Each batch should produce 3 matches against its own 3 targets (which
-        // sit at the start / middle of the combined target list, respectively).
-        assert_eq!(matches_a.len(), 3, "slot 0 matches: {matches_a:?}");
-        assert_eq!(matches_b.len(), 3, "slot 1 matches: {matches_b:?}");
-
-        // Targets in `all_targets` for inputs_a are at indices 0..3; for inputs_b
-        // at indices 3..6.
+        assert_eq!(matches_a.len(), 3);
+        assert_eq!(matches_b.len(), 3);
         for m in &matches_a {
-            assert!(m.target_idx < 3, "slot 0 hit unexpected target: {m:?}");
+            assert!(m.target_idx < 3);
         }
         for m in &matches_b {
-            assert!(
-                m.target_idx >= 3 && m.target_idx < 6,
-                "slot 1 hit unexpected target: {m:?}"
-            );
+            assert!(m.target_idx >= 3 && m.target_idx < 6);
         }
     }
 }
