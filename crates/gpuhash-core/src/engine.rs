@@ -24,6 +24,8 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
+use std::collections::VecDeque;
+
 use crate::{
     attacks::build_source,
     config::{AttackConfig, Backend},
@@ -31,7 +33,7 @@ use crate::{
     event::{AttackSummary, EngineEvent},
     gpu::{
         buffers::{CandidateSlot, MAX_CANDIDATE_LEN},
-        runner::Md5GpuRunner,
+        runner::{Md5GpuRunner, DEFAULT_MAX_IN_FLIGHT},
     },
     hash::Algorithm,
     loader::{load_targets, TargetSet},
@@ -171,7 +173,13 @@ async fn run_gpu(
     // candidate against this target set (collision-resistant hash). batch_size is
     // therefore a safe upper bound on matches-per-dispatch.
     let max_matches = batch_size;
-    let runner = Md5GpuRunner::new(&targets.hashes, batch_size, max_matches).await?;
+    let runner = Md5GpuRunner::new(
+        &targets.hashes,
+        batch_size,
+        max_matches,
+        DEFAULT_MAX_IN_FLIGHT,
+    )
+    .await?;
 
     let start = Instant::now();
     let mut tested: u64 = 0;
@@ -179,59 +187,78 @@ async fn run_gpu(
     let mut oversize_skipped: u64 = 0;
     let mut last_progress = Instant::now();
 
+    // Ring-buffer scheduler: submit up to `max_in_flight` batches before waiting
+    // on the oldest. While slot N is being read back, slot N+1's dispatch is
+    // already on the queue (and the host can fill the next CPU-side batch).
+    let max_in_flight = runner.max_in_flight();
+    let mut pending: VecDeque<PendingBatch> = VecDeque::with_capacity(max_in_flight);
+
     let mut slot_batch: Vec<CandidateSlot> = Vec::with_capacity(batch_size as usize);
     let mut plaintext_batch: Vec<String> = Vec::with_capacity(batch_size as usize);
+    let mut next_slot: usize = 0;
     let mut exhausted = false;
 
-    while !exhausted {
+    loop {
         if cancel.is_cancelled() {
             return Err(Error::Cancelled);
         }
 
-        // Fill one batch.
-        slot_batch.clear();
-        plaintext_batch.clear();
-        while slot_batch.len() < batch_size as usize {
-            match source.next_candidate()? {
-                None => {
-                    exhausted = true;
-                    break;
-                }
-                Some(candidate) => match CandidateSlot::pack(candidate.as_bytes()) {
-                    Some(slot) => {
-                        slot_batch.push(slot);
-                        plaintext_batch.push(candidate);
-                    }
+        // Prime / refill: keep the queue full up to max_in_flight.
+        while pending.len() < max_in_flight && !exhausted {
+            slot_batch.clear();
+            plaintext_batch.clear();
+            while slot_batch.len() < batch_size as usize {
+                match source.next_candidate()? {
                     None => {
-                        // Single-block MD5 caps candidates at MAX_CANDIDATE_LEN bytes.
-                        // We still count toward `tested` so progress totals remain
-                        // accurate, but the candidate is not dispatched.
-                        oversize_skipped += 1;
-                        tested += 1;
+                        exhausted = true;
+                        break;
                     }
-                },
+                    Some(candidate) => match CandidateSlot::pack(candidate.as_bytes()) {
+                        Some(slot) => {
+                            slot_batch.push(slot);
+                            plaintext_batch.push(candidate);
+                        }
+                        None => {
+                            oversize_skipped += 1;
+                            tested += 1;
+                        }
+                    },
+                }
             }
+            if slot_batch.is_empty() {
+                break;
+            }
+
+            runner.submit(next_slot, &slot_batch)?;
+            pending.push_back(PendingBatch {
+                slot: next_slot,
+                plaintexts: std::mem::take(&mut plaintext_batch),
+                candidate_count: slot_batch.len() as u64,
+            });
+            // Re-create the plaintext_batch capacity for the next fill (the
+            // previous Vec moved into PendingBatch).
+            plaintext_batch = Vec::with_capacity(batch_size as usize);
+            next_slot = (next_slot + 1) % max_in_flight;
         }
 
-        if slot_batch.is_empty() {
+        // Nothing left in flight and nothing more to feed — we're done.
+        let Some(batch) = pending.pop_front() else {
             break;
-        }
+        };
 
-        let matches = runner.dispatch_batch(&slot_batch).await?;
+        let matches = runner.read_matches(batch.slot).await?;
         for m in matches {
             let idx = m.candidate_idx as usize;
-            // Defence-in-depth: a malformed kernel could in principle emit an
-            // out-of-range index. Skip silently rather than panic.
-            if idx >= plaintext_batch.len() {
+            if idx >= batch.plaintexts.len() {
                 continue;
             }
             let _ = tx.send(EngineEvent::Match {
-                plaintext: plaintext_batch[idx].clone(),
+                plaintext: batch.plaintexts[idx].clone(),
                 target_idx: m.target_idx,
             });
             matches_total += 1;
         }
-        tested += slot_batch.len() as u64;
+        tested += batch.candidate_count;
 
         if last_progress.elapsed() >= Duration::from_millis(100) {
             emit_progress(tx, tested, total, &start);
@@ -256,6 +283,15 @@ async fn run_gpu(
         },
     });
     Ok(())
+}
+
+/// One in-flight batch waiting for its results. Owns the plaintext list so that
+/// when matches come back (by candidate index) we can map them to the original
+/// strings the engine emits via `EngineEvent::Match`.
+struct PendingBatch {
+    slot: usize,
+    plaintexts: Vec<String>,
+    candidate_count: u64,
 }
 
 fn emit_progress(
