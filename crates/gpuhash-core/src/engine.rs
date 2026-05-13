@@ -1,8 +1,9 @@
 //! The engine orchestrates an audit and streams progress events.
 //!
-//! Phase 1 wired the CPU path; Phase 3 adds a GPU path behind the same
-//! `EngineEvent` contract — the consumer (CLI, Tauri shell) sees the same event
-//! shape regardless of backend.
+//! Phase 1 wired the CPU path; Phase 3 added the dictionary GPU path; Phase 4
+//! adds the bruteforce GPU path behind the same `EngineEvent` contract. The
+//! consumer (CLI, Tauri shell) sees the same event shape regardless of which
+//! backend/mode runs underneath.
 //!
 //! # Lifecycle
 //!
@@ -19,24 +20,25 @@
 //! `engine.run` requires a tokio runtime context (it calls `tokio::spawn`). The
 //! CLI runs under `#[tokio::main]`; the Tauri shell runs Tauri's tokio runtime.
 
+use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use std::collections::VecDeque;
-
 use crate::{
     attacks::build_source,
-    config::{AttackConfig, Backend},
+    config::{AttackConfig, AttackMode, Backend},
     digest::digest,
     event::{AttackSummary, EngineEvent},
     gpu::{
+        bruteforce_runner::Md5BruteforceRunner,
         buffers::{CandidateSlot, MAX_CANDIDATE_LEN},
         runner::{Md5GpuRunner, DEFAULT_MAX_IN_FLIGHT},
     },
     hash::Algorithm,
     loader::{load_targets, TargetSet},
+    mask::Mask,
     Error, Result,
 };
 
@@ -130,7 +132,6 @@ async fn run_cpu(
 
         tested += 1;
 
-        // Throttle Progress events to ~10 Hz.
         if last_progress.elapsed() >= Duration::from_millis(100) {
             emit_progress(tx, tested, total, &start);
             last_progress = Instant::now();
@@ -160,6 +161,25 @@ async fn run_gpu(
     }
 
     let targets: TargetSet = load_targets(&cfg.hashes_path, cfg.algo)?;
+
+    match &cfg.mode {
+        AttackMode::Dictionary { .. } => run_gpu_dict(&cfg, &targets, tx, cancel).await,
+        AttackMode::Bruteforce { mask, start, end } => {
+            let parsed = Mask::parse(mask).map_err(Error::BadFormat)?;
+            let total = parsed.total();
+            let start = *start;
+            let end = end.unwrap_or(total);
+            run_gpu_bruteforce(&cfg, &targets, parsed, start, end, tx, cancel).await
+        }
+    }
+}
+
+async fn run_gpu_dict(
+    cfg: &AttackConfig,
+    targets: &TargetSet,
+    tx: &mpsc::UnboundedSender<EngineEvent>,
+    cancel: &CancellationToken,
+) -> Result<()> {
     let mut source = build_source(&cfg.mode)?;
     let total = source.estimate_total();
 
@@ -169,9 +189,6 @@ async fn run_gpu(
     });
 
     let batch_size = DEFAULT_GPU_BATCH;
-    // Each candidate produces one digest, so per dispatch at most one match per
-    // candidate against this target set (collision-resistant hash). batch_size is
-    // therefore a safe upper bound on matches-per-dispatch.
     let max_matches = batch_size;
     let runner = Md5GpuRunner::new(
         &targets.hashes,
@@ -187,11 +204,8 @@ async fn run_gpu(
     let mut oversize_skipped: u64 = 0;
     let mut last_progress = Instant::now();
 
-    // Ring-buffer scheduler: submit up to `max_in_flight` batches before waiting
-    // on the oldest. While slot N is being read back, slot N+1's dispatch is
-    // already on the queue (and the host can fill the next CPU-side batch).
     let max_in_flight = runner.max_in_flight();
-    let mut pending: VecDeque<PendingBatch> = VecDeque::with_capacity(max_in_flight);
+    let mut pending: VecDeque<PendingDictBatch> = VecDeque::with_capacity(max_in_flight);
 
     let mut slot_batch: Vec<CandidateSlot> = Vec::with_capacity(batch_size as usize);
     let mut plaintext_batch: Vec<String> = Vec::with_capacity(batch_size as usize);
@@ -203,7 +217,6 @@ async fn run_gpu(
             return Err(Error::Cancelled);
         }
 
-        // Prime / refill: keep the queue full up to max_in_flight.
         while pending.len() < max_in_flight && !exhausted {
             slot_batch.clear();
             plaintext_batch.clear();
@@ -230,18 +243,15 @@ async fn run_gpu(
             }
 
             runner.submit(next_slot, &slot_batch)?;
-            pending.push_back(PendingBatch {
+            pending.push_back(PendingDictBatch {
                 slot: next_slot,
                 plaintexts: std::mem::take(&mut plaintext_batch),
                 candidate_count: slot_batch.len() as u64,
             });
-            // Re-create the plaintext_batch capacity for the next fill (the
-            // previous Vec moved into PendingBatch).
             plaintext_batch = Vec::with_capacity(batch_size as usize);
             next_slot = (next_slot + 1) % max_in_flight;
         }
 
-        // Nothing left in flight and nothing more to feed — we're done.
         let Some(batch) = pending.pop_front() else {
             break;
         };
@@ -274,6 +284,128 @@ async fn run_gpu(
         );
     }
 
+    finish(tx, tested, matches_total, start);
+    Ok(())
+}
+
+async fn run_gpu_bruteforce(
+    cfg: &AttackConfig,
+    targets: &TargetSet,
+    mask: Mask,
+    range_start: u64,
+    range_end: u64,
+    tx: &mpsc::UnboundedSender<EngineEvent>,
+    cancel: &CancellationToken,
+) -> Result<()> {
+    let total_keyspace = mask.total();
+    if range_start > range_end {
+        return Err(Error::BadFormat(format!(
+            "bruteforce range start={range_start} > end={range_end}"
+        )));
+    }
+    if range_end > total_keyspace {
+        return Err(Error::BadFormat(format!(
+            "bruteforce end={range_end} exceeds mask keyspace {total_keyspace}"
+        )));
+    }
+    // The Phase-4 shader uses a u32 candidate index, which `Mask::parse` already
+    // enforces by refusing keyspaces > u32::MAX. Subranges therefore also fit.
+    if range_end > u32::MAX as u64 {
+        return Err(Error::Gpu(format!(
+            "bruteforce end={range_end} exceeds u32; Phase 4 shader uses 32-bit indices"
+        )));
+    }
+
+    let span = range_end - range_start;
+    let _ = tx.send(EngineEvent::Started {
+        algo: cfg.algo,
+        total: Some(span),
+    });
+
+    let batch_size = DEFAULT_GPU_BATCH;
+    let max_matches = batch_size;
+    let runner = Md5BruteforceRunner::new(
+        &mask,
+        &targets.hashes,
+        batch_size,
+        max_matches,
+        DEFAULT_MAX_IN_FLIGHT,
+    )
+    .await?;
+
+    let start = Instant::now();
+    let mut tested: u64 = 0;
+    let mut matches_total: u64 = 0;
+    let mut last_progress = Instant::now();
+
+    let max_in_flight = runner.max_in_flight();
+    let mut pending: VecDeque<PendingBruteBatch> = VecDeque::with_capacity(max_in_flight);
+
+    let mut cursor: u64 = range_start;
+    let mut next_slot: usize = 0;
+
+    loop {
+        if cancel.is_cancelled() {
+            return Err(Error::Cancelled);
+        }
+
+        // Prime / refill.
+        while pending.len() < max_in_flight && cursor < range_end {
+            let remaining = range_end - cursor;
+            let count = remaining.min(batch_size as u64) as u32;
+            let base = cursor as u32;
+            runner.submit(next_slot, base, count)?;
+            pending.push_back(PendingBruteBatch {
+                slot: next_slot,
+                base,
+                count,
+            });
+            cursor += count as u64;
+            next_slot = (next_slot + 1) % max_in_flight;
+        }
+
+        let Some(batch) = pending.pop_front() else {
+            break;
+        };
+
+        let matches = runner.read_matches(batch.slot).await?;
+        for m in matches {
+            if m.candidate_idx >= batch.count {
+                continue;
+            }
+            let abs_idx = batch.base as u64 + m.candidate_idx as u64;
+            let bytes = mask.candidate_at(abs_idx);
+            // Mask emits ASCII bytes only (parser validates literals are ASCII,
+            // charsets are inherently ASCII), so this conversion is infallible
+            // in practice.
+            let plaintext = String::from_utf8(bytes).unwrap_or_else(|_| {
+                tracing::error!("mask emitted non-utf8 bytes — should be unreachable");
+                String::new()
+            });
+            let _ = tx.send(EngineEvent::Match {
+                plaintext,
+                target_idx: m.target_idx,
+            });
+            matches_total += 1;
+        }
+        tested += batch.count as u64;
+
+        if last_progress.elapsed() >= Duration::from_millis(100) {
+            emit_progress(tx, tested, Some(span), &start);
+            last_progress = Instant::now();
+        }
+    }
+
+    finish(tx, tested, matches_total, start);
+    Ok(())
+}
+
+fn finish(
+    tx: &mpsc::UnboundedSender<EngineEvent>,
+    tested: u64,
+    matches_total: u64,
+    start: Instant,
+) {
     let elapsed_secs = start.elapsed().as_secs_f64();
     let _ = tx.send(EngineEvent::Finished {
         summary: AttackSummary {
@@ -282,16 +414,21 @@ async fn run_gpu(
             elapsed_secs,
         },
     });
-    Ok(())
 }
 
-/// One in-flight batch waiting for its results. Owns the plaintext list so that
-/// when matches come back (by candidate index) we can map them to the original
-/// strings the engine emits via `EngineEvent::Match`.
-struct PendingBatch {
+/// One in-flight dictionary batch waiting for its results.
+struct PendingDictBatch {
     slot: usize,
     plaintexts: Vec<String>,
     candidate_count: u64,
+}
+
+/// One in-flight bruteforce batch — no plaintexts stored, we reconstruct from
+/// `mask.candidate_at(base + match.candidate_idx)` when a match comes back.
+struct PendingBruteBatch {
+    slot: usize,
+    base: u32,
+    count: u32,
 }
 
 fn emit_progress(

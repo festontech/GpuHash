@@ -65,6 +65,55 @@ pub struct MatchRecord {
     pub target_idx: u32,
 }
 
+// ---- Bruteforce-kernel buffer types ----
+
+/// One mask position on the GPU. Mirrors the WGSL `MaskPos` in
+/// `shaders/md5_bruteforce.wgsl`.
+///
+/// `kind` is one of:
+///   - 0 = literal byte (`value` holds the byte)
+///   - 1 = lowercase a–z
+///   - 2 = uppercase A–Z
+///   - 3 = digit 0–9
+#[repr(C)]
+#[derive(Pod, Zeroable, Clone, Copy, Debug, Default)]
+pub struct MaskPosGpu {
+    pub kind: u32,
+    pub value: u32,
+}
+
+impl MaskPosGpu {
+    pub fn literal(b: u8) -> Self {
+        Self {
+            kind: 0,
+            value: b as u32,
+        }
+    }
+    pub fn lowercase() -> Self {
+        Self { kind: 1, value: 0 }
+    }
+    pub fn uppercase() -> Self {
+        Self { kind: 2, value: 0 }
+    }
+    pub fn digit() -> Self {
+        Self { kind: 3, value: 0 }
+    }
+}
+
+/// Uniform-buffer parameters for the bruteforce kernel.
+#[repr(C)]
+#[derive(Pod, Zeroable, Clone, Copy, Debug)]
+pub struct BruteforceParams {
+    pub num_positions: u32,
+    pub num_candidates: u32,
+    pub num_targets: u32,
+    pub max_matches: u32,
+    pub base_index: u32,
+    pub _pad0: u32,
+    pub _pad1: u32,
+    pub _pad2: u32,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -102,5 +151,16 @@ mod tests {
     fn params_is_uniform_safe() {
         // Uniform buffers require a size that's a multiple of 16.
         assert_eq!(std::mem::size_of::<Params>(), 16);
+    }
+
+    #[test]
+    fn bruteforce_params_is_uniform_safe() {
+        assert_eq!(std::mem::size_of::<BruteforceParams>(), 32);
+    }
+
+    #[test]
+    fn mask_pos_gpu_size() {
+        // u32 kind + u32 value = 8 bytes; WGSL `MaskPos` matches.
+        assert_eq!(std::mem::size_of::<MaskPosGpu>(), 8);
     }
 }

@@ -15,6 +15,7 @@ pub mod event;
 pub mod gpu;
 pub mod hash;
 pub mod loader;
+pub mod mask;
 
 // Phase 4+ scheduler / benchmark / session modules:
 // pub mod scheduler;

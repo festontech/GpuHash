@@ -112,9 +112,17 @@ impl Md5GpuRunner {
             .map_err(|e| Error::Gpu(format!("request_device: {e}")))?;
 
         // ---- pipeline ----
+        // The dict shader is a concatenation of the shared MD5 helpers
+        // (constants, round function, target-scan) and the dict-specific bindings
+        // + entry point. WGSL has no preprocessor / include — we glue here.
+        let shader_src = format!(
+            "{}\n{}",
+            include_str!("shaders/md5_common.wgsl"),
+            include_str!("shaders/md5_dict.wgsl"),
+        );
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("md5"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/md5.wgsl").into()),
+            label: Some("md5-dict"),
+            source: wgpu::ShaderSource::Wgsl(shader_src.into()),
         });
         let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("md5-pipeline"),
