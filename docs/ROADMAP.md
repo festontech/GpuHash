@@ -88,34 +88,36 @@ Mark a phase complete by checking its top-level box and adding a logbook entry s
 
 **Goal.** Subcommands, `--json`, sessions, exit codes. Test from PowerShell.
 
-- [ ] `gpuhash session list/save/load/delete`.
-- [ ] `--json` mode emits NDJSON `EngineEvent`s.
-- [ ] Exit codes: 0 / 1 (matches found) / 2 (error).
-- [ ] PowerShell smoke test: pipe `--json` output into `ConvertFrom-Json`.
+- [x] `gpuhash session list/save/load/delete` (`session show` added as a bonus).
+- [x] `--json` mode emits NDJSON `EngineEvent`s (wired in Phase 1; re-verified by `scripts/smoke.ps1`).
+- [x] Exit codes: 0 / 1 (matches found) / 2 (error).
+- [x] PowerShell smoke test: `scripts/smoke.ps1` builds the CLI then pipes `--json` output into `ConvertFrom-Json` and exercises the full session lifecycle.
 
 ---
 
-## Phase 7 — Tauri + React shell (3–4 days)
+## Phase 7 — Tauri + vanilla-ts shell (3–4 days)
 
 **Goal.** Commands, events, basic Dashboard with start/cancel. `npm run tauri dev` launches on Windows.
 
-- [ ] `npm create tauri-app@latest` to scaffold `crates/gpuhash-tauri/` (React + TypeScript template).
-- [ ] Add `gpuhash-core` path dependency in the new Tauri crate.
-- [ ] Implement `start_attack`, `cancel_attack`, `benchmark` commands.
-- [ ] React Dashboard, AttackPanel, LiveStats.
-- [ ] Listener that pushes `EngineEvent`s into a Zustand store.
-- [ ] `npm run tauri dev` launches; clicking **Audit** runs the same workload as the CLI.
+**Note.** Phase 7 was originally planned as Tauri + React. Settled on **vanilla TypeScript** instead — see logbook 2026-05-25 (Phase 7). React/Zustand stay available as a Phase 10 stretch if the UI grows.
+
+- [x] `npm create tauri-app@latest crates/gpuhash-tauri --template vanilla-ts --tauri-version 2 -y -f`.
+- [x] Added `gpuhash-core` path dependency in `crates/gpuhash-tauri/src-tauri/Cargo.toml`; new crate joined the workspace.
+- [x] Implemented `start_attack`, `cancel_attack`, `benchmark`, `list_sessions`, `load_session`, `delete_session` Tauri commands.
+- [x] Vanilla-ts Dashboard (attack form, live stats, match list, sessions table) replacing the template's Greet UI.
+- [x] `listen("engine-event")` drains `EngineEvent`s straight into DOM updates — no Zustand needed at this size.
+- [x] `npm run tauri dev` launches: Vite ready in ~430 ms, backend compiles + launches the webview window.
 
 ---
 
 ## Phase 8 — Live charts + sessions (2 days)
 
-**Goal.** Recharts, persistent sessions, demo-ready UI.
+**Goal.** Live H/s chart, persistent sessions surfaced in the UI, demo-ready.
 
-- [ ] `recharts` line chart bound to the Zustand `history` slice.
-- [ ] `MatchesTable` streaming as matches arrive.
-- [ ] `SessionList` with save/load wired to backend `save_session` command.
-- [ ] Demo script in LOGBOOK.md.
+- [x] Hand-rolled SVG sparkline (last 60 `Progress` samples). Picked instead of recharts because the shell is vanilla-ts — see logbook 2026-05-25 (Phase 8).
+- [x] `MatchesTable` streams idx + plaintext rows as matches arrive (was a `<ol>` in Phase 7).
+- [x] `SessionList` has Load + Delete per row. Save is implicit via `session_name` on Run; load replays the stored matches into the UI without re-executing.
+- [x] Demo script in LOGBOOK.md (2026-05-25 Phase 8 entry).
 
 ---
 

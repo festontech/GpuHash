@@ -1,0 +1,179 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="stylesheet" href="/src/styles.css" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>GpuHash Audit</title>
+    <script type="module" src="/src/main.ts" defer></script>
+  </head>
+
+  <body>
+    <main class="app">
+      <header>
+        <h1>GpuHash Audit</h1>
+        <p class="tag">
+          Educational password auditor. Use against hashes you own. See
+          <code>docs/ETHICS.md</code>.
+        </p>
+      </header>
+
+      <section class="panel">
+        <h2>Random Demo</h2>
+        <p class="muted">
+          Generate a synthetic wordlist + hashes pair under
+          <code>%LOCALAPPDATA%\gpuhash\demo\</code> and auto-populate the form.
+          A handful of random candidates are planted as targets so the audit
+          will find them.
+        </p>
+        <form id="demo-form" class="demo-form">
+          <label>
+            Candidates
+            <input id="demo-count" type="number" min="10" max="1000000" value="10000" />
+          </label>
+          <label>
+            Planted matches
+            <input id="demo-planted" type="number" min="1" max="1000" value="25" />
+          </label>
+          <label>
+            Algorithm
+            <select id="demo-algo">
+              <option value="md5" selected>md5</option>
+              <option value="sha1">sha1</option>
+              <option value="sha256">sha256</option>
+            </select>
+          </label>
+          <div class="actions">
+            <button id="demo-generate" type="submit">Generate</button>
+          </div>
+        </form>
+        <p id="demo-status" class="muted"></p>
+      </section>
+
+      <section class="panel">
+        <h2>Attack</h2>
+        <form id="attack-form">
+          <label>
+            Algorithm
+            <select id="algo" required>
+              <option value="md5">md5</option>
+              <option value="sha1">sha1</option>
+              <option value="sha256">sha256</option>
+            </select>
+          </label>
+
+          <label>
+            Hashes file (absolute path)
+            <input
+              id="hashes"
+              type="text"
+              value="C:\repos\GpuHash\examples\sample_hashes.txt"
+              placeholder="C:\path\to\hashes.txt"
+              required
+            />
+          </label>
+
+          <fieldset>
+            <legend>Mode</legend>
+            <label class="radio">
+              <input type="radio" name="mode" value="dictionary" checked />
+              Dictionary
+            </label>
+            <label class="radio">
+              <input type="radio" name="mode" value="bruteforce" />
+              Bruteforce mask
+            </label>
+            <label id="wordlist-label">
+              Wordlist (absolute path)
+              <input
+                id="wordlist"
+                type="text"
+                value="C:\repos\GpuHash\examples\tiny_dict.txt"
+                placeholder="C:\path\to\wordlist.txt"
+              />
+            </label>
+            <label id="mask-label" hidden>
+              Mask
+              <input id="mask" type="text" placeholder="?l?l?l?l?d?d" />
+            </label>
+          </fieldset>
+
+          <label class="radio">
+            <input id="gpu" type="checkbox" />
+            Run on GPU
+          </label>
+
+          <label>
+            Session name (optional — saves on completion)
+            <input id="session" type="text" placeholder="my-audit" />
+          </label>
+
+          <label class="ack">
+            <input id="ack" type="checkbox" required />
+            I own these hashes (see ETHICS.md).
+          </label>
+
+          <div class="actions">
+            <button id="start" type="submit">Run Audit</button>
+            <button id="cancel" type="button" disabled>Cancel</button>
+          </div>
+        </form>
+      </section>
+
+      <section class="panel">
+        <h2>Live</h2>
+        <dl class="stats">
+          <dt>Status</dt>
+          <dd id="status">idle</dd>
+          <dt>Tested</dt>
+          <dd id="tested">0</dd>
+          <dt>Hashes / sec</dt>
+          <dd id="rate">0</dd>
+          <dt>ETA</dt>
+          <dd id="eta">—</dd>
+          <dt>Elapsed</dt>
+          <dd id="elapsed">—</dd>
+        </dl>
+        <div class="chart-wrap" aria-label="Hashes-per-second over the last 60 samples">
+          <svg id="rate-chart" viewBox="0 0 600 120" preserveAspectRatio="none">
+            <polyline id="rate-line" />
+            <text id="rate-peak" x="6" y="14" />
+          </svg>
+        </div>
+      </section>
+
+      <section class="panel">
+        <h2>Matches</h2>
+        <table class="matches">
+          <thead>
+            <tr>
+              <th class="idx">#</th>
+              <th>Plaintext</th>
+            </tr>
+          </thead>
+          <tbody id="matches-body"></tbody>
+        </table>
+        <p id="matches-empty" class="muted">No matches yet.</p>
+      </section>
+
+      <section class="panel">
+        <h2>Sessions</h2>
+        <button id="refresh-sessions" type="button">Refresh</button>
+        <table class="sessions">
+          <thead>
+            <tr>
+              <th>Name</th>
+              <th>Status</th>
+              <th>Matches</th>
+              <th>Updated</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody id="sessions-body"></tbody>
+        </table>
+      </section>
+
+      <pre id="log" class="log"></pre>
+    </main>
+  </body>
+</html>

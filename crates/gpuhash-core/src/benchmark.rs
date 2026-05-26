@@ -8,6 +8,8 @@
 
 use std::time::Instant;
 
+use serde::{Deserialize, Serialize};
+
 use crate::gpu::{
     algos::{md5 as md5_kernel, sha1 as sha1_kernel, sha256 as sha256_kernel},
     bruteforce_runner::BruteforceRunner,
@@ -18,7 +20,7 @@ use crate::mask::Mask;
 use crate::{Algorithm, Error, Result};
 
 /// Per-algorithm benchmark result.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct BenchmarkReport {
     pub algo: Algorithm,
     pub batch_size: u32,
@@ -29,7 +31,7 @@ pub struct BenchmarkReport {
 }
 
 /// Bench knobs. Sensible defaults are baked in; callers override via the CLI.
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, Serialize, Deserialize)]
 pub struct BenchmarkConfig {
     /// Total wall-clock budget (seconds). Defaults to 5 — short enough for the
     /// `benchmark` CLI smoke check, long enough to drown out cold-start tax.

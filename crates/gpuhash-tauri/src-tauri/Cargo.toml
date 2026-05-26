@@ -1,0 +1,31 @@
+[package]
+name = "gpuhash-tauri"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Tauri 2.x desktop shell for the GPU Password Auditing Framework."
+
+[lints.rust]
+unsafe_code = "deny"
+rust_2018_idioms = "warn"
+
+[lib]
+# Tauri 2 wants the GUI entry point exposed as a library so the same code can
+# target desktop and mobile. The `_lib` suffix dodges the bin-vs-lib name
+# clash that bites on Windows (see rust-lang/cargo#8519).
+name = "gpuhash_tauri_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+gpuhash-core = { path = "../../gpuhash-core" }
+tauri        = { version = "2", features = [] }
+serde        = { workspace = true }
+serde_json   = { workspace = true }
+tokio        = { workspace = true }
+tokio-util   = { workspace = true }
+tracing      = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow       = { workspace = true }

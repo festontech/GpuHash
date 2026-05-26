@@ -563,7 +563,9 @@ fn main() {
 
 ---
 
-## 6. React Frontend
+## 6. Frontend
+
+**As-built note (Phase 7, 2026-05-25):** the shell shipped as **vanilla TypeScript**, not React. The dashboard is small enough (~280 lines of TS) that JSX + Zustand are ceremony, not leverage, and the `EngineEvent` JSON contract is what matters — the framework on top is replaceable. The remainder of §6 below is kept as **reference material** for the React/Zustand sketch that motivated the architecture. If the UI grows past one screen, swapping in React or Vue is a routine port (the IPC and event contract stay identical). See LOGBOOK 2026-05-25 (Phase 7) for the reasoning.
 
 ### 6.1 UI structure
 ```

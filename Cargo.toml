@@ -3,8 +3,8 @@ resolver = "2"
 members = [
     "crates/gpuhash-core",
     "crates/gpuhash-cli",
+    "crates/gpuhash-tauri/src-tauri",
 ]
-# crates/gpuhash-tauri is added in Phase 7 via `npm create tauri-app`.
 
 [workspace.package]
 version = "0.1.0"

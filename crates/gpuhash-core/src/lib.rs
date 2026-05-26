@@ -17,11 +17,10 @@ pub mod gpu;
 pub mod hash;
 pub mod loader;
 pub mod mask;
+pub mod session;
 
-// Phase 4+ scheduler / benchmark / session modules:
+// Phase 4+ scheduler module:
 // pub mod scheduler;
-// pub mod benchmark;
-// pub mod session;
 
 pub use benchmark::{benchmark_algo, BenchmarkConfig, BenchmarkReport};
 pub use config::{AttackConfig, AttackMode, Backend, GpuTuning};
@@ -29,3 +28,4 @@ pub use engine::{Engine, RunningAttack};
 pub use error::{Error, Result};
 pub use event::{AttackSummary, EngineEvent};
 pub use hash::Algorithm;
+pub use session::{sessions_dir, Session, SessionListEntry, SessionMatch, SessionStatus};

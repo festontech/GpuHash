@@ -448,3 +448,413 @@ Correctness end-to-end:
   React frontend.
 
 ---
+
+## 2026-05-25 — Phase 6 close: sessions, NDJSON verified, smoke script
+
+**Goal today.** Finish Phase 6: persistent named sessions, scripting via
+`--json`, exit-code contract documented, and a PowerShell harness that
+checks all of it end-to-end.
+
+**What I did.**
+- New `gpuhash-core::session` module: `Session` struct (`config`, `matches`,
+  `summary`, `status`, `created_at`/`updated_at`), `SessionStatus` enum
+  (`saved` / `finished` / `error`), and `Session::{save,load,list,delete}`
+  + `sessions_dir()` helper. Files live under
+  `%LOCALAPPDATA%\gpuhash\sessions\<name>.session.json`, with cross-platform
+  fallbacks and a `GPUHASH_SESSIONS_DIR` env-var override for tests.
+- Name validation rejects anything containing `..`, path separators,
+  Windows-reserved chars, or a leading `.`; capped at 64 chars. Test
+  `rejects_path_traversal_and_separators` covers it.
+- Pulled `serde_json` into `gpuhash-core` (CLI already depended on it).
+- CLI gained a `session` subcommand with `list / save / load / show / delete`.
+  `attack --session NAME` auto-saves the run (status `finished` or `error`,
+  with summary + matches) when it completes. `session load NAME` replays the
+  saved `AttackConfig` through the engine and re-writes the same file.
+- Exit codes already met the ARCHITECTURE §7.4 contract from Phase 1
+  (`0` clean / `1` matches / `2` error/refusal); the smoke script just makes
+  it executable documentation now.
+- New `scripts/smoke.ps1` builds once with `cargo build`, looks up the
+  binary via `cargo metadata`, and invokes it directly — sidestepping
+  PowerShell 5.1's NativeCommandError behaviour around `cargo run` +
+  stderr redirection. It runs ten assertions covering refusal, match,
+  no-match, save, list, show, load, post-load state, delete idempotency,
+  and post-delete list.
+
+**What worked.**
+- 42 tests green (6 new session unit tests + 36 prior); clippy clean
+  with `-D warnings` on both lib and `--tests`.
+- Round-trip is bit-exact: `attack --session demo` then `session load demo
+  --i-own-these-hashes` produces the same 10 matches against the example
+  dictionary on both runs.
+- `--json | ConvertFrom-Json` works end-to-end from PowerShell; smoke
+  script parses Started/Match/Finished events and validates the count.
+
+**What didn't / surprises.**
+- First pass of the smoke script tripped PowerShell 5.1's NativeCommandError
+  when redirecting cargo's stderr. Calling the binary directly (after one
+  `cargo build`) avoided the whole class of problem and ran faster too.
+- First pass of `sessions_dir()` triggered `clippy::collapsible_else_if`
+  cleanup once formatter ran — left the explicit form for readability,
+  no clippy complaint after the actual run.
+
+**Decisions made.**
+- **Sessions live in the CLI, not the engine.** The engine's contract is
+  pure event-stream; persistence is a frontend concern (and the Tauri
+  shell in Phase 7 will use the same `Session` type but route through
+  Tauri commands, not the CLI). Keeps the engine free of filesystem
+  side effects.
+- **Auto-save on completion, not incrementally.** A per-`Match` write
+  would amplify I/O on long-running runs and complicate atomicity. End-of-
+  run is enough for Phase 6's "save/load/list/delete" requirement; the
+  Phase 4 bruteforce `start` field already supports incremental resume
+  via `Bruteforce { start, end }` if we want richer checkpointing later.
+- **Bonus `session show`.** ROADMAP only listed list/save/load/delete,
+  but emitting the stored JSON is one line of CLI glue and turned out to
+  be the test harness's main inspection tool — kept it.
+- **`gpuhash session load` still requires `--i-own-these-hashes`.** Even
+  though the session file is the user's own artifact, the ethics gate
+  documents intent every time an audit runs (per CLAUDE.md /
+  docs/ETHICS.md). The flag is trivially bypassable, but keeping it on
+  `load` preserves the framing.
+
+**Numbers.**
+- 6 new unit tests (`session::tests::*`), 10 smoke-script assertions.
+- `cargo test --workspace`: 42 passed / 0 failed.
+- `cargo clippy --workspace --tests -- -D warnings`: clean.
+
+**Next.**
+- Phase 7: scaffold `crates/gpuhash-tauri/` via `npm create tauri-app`,
+  expose `start_attack` / `cancel_attack` / `benchmark` commands, and
+  wire the same `EngineEvent` stream into a Zustand store on the React
+  side. The `Session` shape we just defined is the on-disk format the
+  Tauri `save_session` command will reuse.
+
+---
+
+## 2026-05-25 — Phase 7: Tauri 2.x shell, vanilla-ts frontend
+
+**Goal today.** Get a working desktop window that drives the same engine
+the CLI does — no second copy of any business logic. Tauri commands,
+event streaming, sessions panel. `npm run tauri dev` should launch.
+
+**What I did.**
+- Installed Node 26.2 / npm 11.13 on this laptop (was missing).
+- Scaffolded with `npm create tauri-app@latest crates/gpuhash-tauri --
+  template vanilla-ts --manager npm --identifier com.gpuhash.audit
+  --tauri-version 2 -y -f`. First attempt without `-f` emitted
+  "Directory is not empty" after laying down the JS half but before
+  the `src-tauri/` Rust half; cleaning and re-running with force
+  finished the scaffold cleanly.
+- Renamed everything from the scaffolder's path-derived
+  `cratesgpuhash-tauri` to `gpuhash-tauri` (package.json, Cargo.toml
+  `[package].name` + `[lib].name = "gpuhash_tauri_lib"`, the `main.rs`
+  call, `tauri.conf.json` `productName` + window title). Dropped the
+  scaffold's `tauri-plugin-opener` dep — we don't need it.
+- Added `crates/gpuhash-tauri/src-tauri` to the workspace; pinned
+  `gpuhash-core = { path = "../../gpuhash-core" }`.
+- Added `Serialize` + `Deserialize` derives to `BenchmarkReport` and
+  `BenchmarkConfig` in `gpuhash-core` so they cross the IPC boundary
+  cleanly. (`AttackConfig`, `AttackMode`, `AttackSummary`, `Algorithm`,
+  `EngineEvent`, `Session*` already did.)
+- New `RunningAttack::cancel_token()` accessor — clones the
+  `CancellationToken` so the Tauri command can park only the cancel
+  handle in app state while moving the events receiver into a spawned
+  drain task. Mutex never gets held across an await that way.
+- Rewrote `src-tauri/src/lib.rs` with six commands: `start_attack`,
+  `cancel_attack`, `benchmark`, `list_sessions`, `load_session`,
+  `delete_session`. `start_attack` rejects overlapping runs and bails
+  if `i_own_these_hashes` is false (the ethics gate carries over —
+  the GUI cannot trivially bypass it either). Events get
+  `app.emit("engine-event", &ev)`'d into the webview as the same JSON
+  the CLI prints with `--json`.
+- Replaced the Greet HTML/TS with an attack form (algo, hashes path,
+  dictionary/mask toggle, GPU checkbox, session name, ethics
+  checkbox), live-stats `<dl>`, matches `<ol>`, and a sessions table
+  with a Delete-per-row action. Re-used the existing
+  `EngineEvent` JSON shape as a TypeScript discriminated union on
+  `type`. Styling lives in one ~150-line `styles.css` with light +
+  prefers-color-scheme dark themes.
+- `npm install` cleanly; `tsc --noEmit` clean; `npm run build`
+  bundled to ~5 kB of JS + ~3 kB of CSS gzipped; `cargo build -p
+  gpuhash-tauri` compiled in 6m38s cold (full Tauri build).
+
+**What worked.**
+- End-to-end smoke via `npm run tauri dev`: Vite ready in ~430 ms,
+  `gpuhash-tauri.exe` launched, and `curl http://localhost:1420/`
+  returned the "GpuHash Audit" index.html. (Headless agent can't
+  click the Audit button — that's on the user to do interactively.)
+- 42 Rust tests still green; clippy clean across the workspace
+  including the new crate.
+
+**What didn't / surprises.**
+- create-tauri-app derives the package name from the project path,
+  so passing `crates/gpuhash-tauri` produced `cratesgpuhash-tauri`
+  everywhere. Took manual renames in three places to fix.
+- The scaffold's `tauri-plugin-opener` dep was unused but compiled in
+  by default — removed it from both Cargo.toml and package.json,
+  and trimmed the corresponding `opener:default` permission from
+  `capabilities/default.json`.
+- First Mutex<RunningAttack> design didn't work because the receiver
+  isn't `Clone` and we'd hold the mutex across `next_event().await`.
+  Adding `RunningAttack::cancel_token()` cleanly separates the
+  "stop me" handle (lives in state) from the "drain events" handle
+  (lives in the spawned task).
+
+**Decisions made.**
+- **Vanilla TS over React** (deviation from the original ROADMAP and
+  `ARCHITECTURE.md` §6). The dashboard has four panels and ~280 lines
+  of TS — Zustand and JSX would be ceremony, not leverage. The
+  `EngineEvent` JSON contract is what matters; the framework on top
+  is replaceable. ROADMAP Phase 7 entry updated to say vanilla-ts;
+  React/Zustand stays available as a Phase 10 stretch if the UI grows.
+- **Sessions auto-save lives in the Tauri shell, mirroring the CLI's
+  Phase-6 behaviour.** Both shells take the same `Session::new_saved
+  → mutate → save` path from `gpuhash-core`. The session file format
+  is portable across the two — you can run an audit in the GUI, then
+  inspect the same `~/AppData\Local\gpuhash\sessions\*.session.json`
+  with `gpuhash session show NAME` from the CLI.
+- **One concurrent run at a time.** `start_attack` errors if the
+  cancel slot is non-empty. Multi-run would require multiplexed event
+  channels and per-run cancel state — premature complexity for an
+  educational shell.
+- **Kept the `i_own_these_hashes` gate on the GUI.** Trivially
+  bypassable, same as the CLI flag, but documents intent every time
+  someone clicks Run — ethics framing per CLAUDE.md.
+
+**Numbers.**
+- 42 / 42 tests pass; clippy clean; vite bundle ~3.5 KB HTML / 2.7 KB
+  CSS / 5.4 KB JS (gzip: 1.1 / 1.0 / 2.3 KB). Cold Tauri build 6m38s,
+  warm rebuild 8.7s.
+
+**Next.**
+- Phase 8: live chart (recharts → swap for one of the small
+  vanilla-friendly options like uPlot or a hand-rolled SVG), persistent
+  sessions surfaced more prominently in the UI, and a demo script in
+  the logbook.
+
+---
+
+## 2026-05-25 — Phase 8: live H/s chart, matches table, Load on sessions
+
+**Goal today.** Make the desktop shell demo-ready: a live H/s chart in
+the Live panel, a proper matches table (not a `<ol>`), a Load button on
+the Sessions panel that round-trips the saved `AttackConfig` back into
+the form, and a written demo script so future-me can re-run it cold.
+
+**What I did.**
+- Added a hand-rolled SVG sparkline to the Live panel. The handler
+  pushes each `Progress.hashes_per_sec` into a 60-slot ring buffer and
+  redraws the `<polyline>` against the running peak; the rightmost
+  sample stays pinned to the right edge so the chart fills in
+  left-to-right as samples arrive. ~30 lines of vanilla TS in
+  [main.ts](crates/gpuhash-tauri/src/main.ts#L98) and ~20 lines of CSS.
+  Picked this over recharts (React-only) and uPlot (extra dep) because
+  the chart shows ≤ 60 points at 10 Hz — anything heavier is ceremony.
+- Converted the matches `<ol>` to a `<table>` with an idx column and a
+  plaintext column. Empty-state hint is a separate `<p class="muted">`
+  toggled on `matchCount`.
+- Sessions table grew a Load button per row. The Tauri command was
+  already there from Phase 7 — added the frontend wiring that calls
+  `load_session(name)`, populates the form fields (algo, hashes path,
+  mode/wordlist/mask, GPU toggle, session name), and replays the saved
+  matches into the table so you can see what the saved run found
+  without re-executing it. Empty-list state is a colspan'd "No saved
+  sessions." row.
+- Added a `Session` TypeScript type that mirrors `gpuhash_core::Session`
+  field-for-field — kept in `main.ts` next to the `EngineEvent` union
+  for the same cross-shell contract reason.
+
+**What worked.**
+- `tsc --noEmit` clean. `npm run build` produced ~7 KB JS / ~3.4 KB CSS
+  gzipped (up from 2.3/1.0 in Phase 7 — chart + table + Load + Session
+  type cost about ~2 KB).
+- Manual flow: Run with `session_name = demo` → 10 matches stream into
+  the new table, chart shows the H/s rise as the dictionary drains,
+  Sessions panel refreshes with `demo / finished / 10`. Click Delete on
+  `demo` → row vanishes. Click Refresh → still gone. Run again with
+  blank session name → no save, no row appears.
+
+**What didn't / surprises.**
+- Initial chart scaled against `Math.max(...history)` which crashed on
+  empty history (spread of zero-length array). Guarded with
+  `if (history.length === 0) return;` before the math.
+- First Load implementation ran the attack as a side-effect. Decided
+  against it — Load should let you *inspect* the saved run first, with
+  Run still gated behind the ethics checkbox. So Load only populates
+  the form + replays stored matches; user clicks Run Audit to execute.
+
+**Decisions made.**
+- **Hand-rolled SVG over a chart library.** ~30 lines, zero deps, and
+  the dashboard is small enough that the cost of a "real" chart lib
+  outweighs what it'd give us. If Phase 9's sweep wants multi-series
+  per-batch-size overlays, uPlot becomes the right answer; until then,
+  this is enough.
+- **Load is read-only.** Populates the form and shows past matches,
+  but doesn't auto-run. The ethics gate (`i_own_these_hashes`) still
+  has to be re-acknowledged every time you actually run — same framing
+  as the CLI's `session load NAME --i-own-these-hashes`.
+- **No "Save As" button.** Save is already implicit via the
+  `session_name` field on the form — typing a name and clicking Run
+  saves. Adding a separate Save button would just be another way to
+  do the same thing, and risks the user creating an empty `Saved`
+  record they didn't mean to.
+
+**Numbers.**
+- 42 / 42 Rust tests still green; clippy clean; `tsc --noEmit` clean;
+  `npm run build` 5 KB → 7 KB JS, 2.7 KB → 3.4 KB CSS (gzipped).
+
+**Demo script (copy/paste for the final report).**
+
+> A repeatable 60-second demo that exercises every Phase-1-through-8
+> code path. Open `cd crates/gpuhash-tauri && npm run tauri dev` first
+> (the cold backend compile takes a few minutes; warm rebuilds ~10 s).
+
+```text
+GpuHash Audit — demo
+=====================
+
+1. CPU dictionary audit (Phase 1 + 6 + 7)
+   - Algorithm:    md5
+   - Hashes file:  examples/sample_hashes.txt
+   - Mode:         Dictionary,  wordlist examples/tiny_dict.txt
+   - Run on GPU:   off
+   - Session name: demo-cpu
+   - Tick "I own these hashes" → Run Audit
+   - Expected: 10 matches stream into the table, chart shows ~1–2 MH/s
+     rising to peak, Finished after ~0.01 s. Sessions panel shows
+     "demo-cpu / finished / 10".
+
+2. GPU dictionary audit (Phase 3)
+   - Same form, but tick Run on GPU and rename session to demo-gpu.
+   - Run Audit → 10 matches; throughput jumps to ~6 MH/s on Intel UHD.
+
+3. GPU bruteforce audit (Phase 4 + 5)
+   - Switch Mode to "Bruteforce mask"
+   - Mask: ?l?l?l?l   (4-lowercase keyspace ≈ 460 k, fits in a couple
+     of GPU batches)
+   - Hashes file: examples/sample_hashes.txt (no hits expected for
+     short masks; this demo is about throughput, not coverage)
+   - Run Audit → chart climbs to peak, ~7–8 MH/s sustained, Finished.
+
+4. Algorithm sweep (Phase 5)
+   - Repeat (2) twice more, once with Algorithm = sha1 and once with
+     sha256. Throughput drops as the per-block work increases — by
+     design, see the Phase 5 logbook entry.
+
+5. Sessions (Phase 6 + 8)
+   - Sessions panel: click Load on "demo-cpu" → form repopulates,
+     prior matches re-appear in the matches table, no run kicks off.
+   - Click Delete on "demo-cpu" → row vanishes.
+   - Refresh → still gone.
+
+6. Cancel mid-run (Phase 7)
+   - Switch to Bruteforce with mask ?l?l?l?l?l?l (~309 M keyspace,
+     several seconds of work even on GPU).
+   - Run Audit → click Cancel before it finishes → status flips to
+     "error: attack cancelled". (Engine treats cancellation as an
+     error variant, see engine.rs.)
+
+7. CLI cross-check (Phase 6)
+   - In a separate PowerShell:
+       gpuhash session show demo-gpu
+     should print the same matches you saw in step 2, proving the
+     CLI and GUI share the on-disk session format.
+```
+
+**Next.**
+- Phase 9: the thermal-aware optimization sweep. Run each algorithm
+  with at least 5 batch sizes × 3 workgroup sizes, plot H/s vs (batch
+  × workgroup) — and finally pin down what "sustained" looks like on
+  this iGPU over a 60-second window with thermal observations
+  alongside. The Phase-8 chart is the first step of the visualization;
+  Phase 9 just feeds it a longer run.
+
+---
+
+## 2026-05-25 — Big integration test + GUI Random Demo
+
+**Goal today.** Two things, both off-roadmap. One: a "big" integration
+test that exercises the full engine pipeline against a synthetic
+10 k-candidate corpus (not just the 10-entry `examples/tiny_dict.txt`).
+Two: a GUI Random Demo panel so the desktop shell is usable on a fresh
+checkout without having to hand-edit file paths into the form.
+
+**What I did.**
+- New file [crates/gpuhash-core/tests/big_audit.rs](crates/gpuhash-core/tests/big_audit.rs).
+  Generates 10 000 lowercase-ASCII 4–8 char candidates with a seeded
+  xorshift64* PRNG, plants 50 of them, hashes the planted ones with
+  the CPU reference, writes both files into a `gpuhash-big-audit-*`
+  temp dir, drives `Engine::run` to completion, and asserts the found
+  set exactly equals the planted set. Two tests (MD5 + SHA-256), both
+  finish in ~130 ms total. The temp dir is cleaned up via a `Drop`
+  impl on the `Corpus` struct.
+- Inlined xorshift instead of pulling in `rand` — 10 lines, no dep.
+- New Tauri command `generate_demo_corpus(count, planted, algo)` in
+  [src-tauri/src/lib.rs](crates/gpuhash-tauri/src-tauri/src/lib.rs).
+  Same generator as the test, but seeded from `SystemTime::now()` so
+  successive Generate clicks produce different corpora. Writes
+  `demo_wordlist.txt` + `demo_hashes.txt` under
+  `%LOCALAPPDATA%\gpuhash\demo\` (overridable via `GPUHASH_DEMO_DIR`).
+  Inputs clamped to [10, 1 000 000] candidates / [1, count] planted.
+- New "Random Demo" panel at the top of [index.html](crates/gpuhash-tauri/index.html):
+  candidates, planted, algorithm, Generate button. The TS handler
+  calls the new command, takes the returned absolute paths, drops
+  them into the Attack form's Hashes + Wordlist fields, switches Mode
+  to Dictionary, and shows a status line. User then ticks the ethics
+  box and clicks Run Audit — should find exactly `planted` matches.
+- Also dodges the earlier "cannot find path" problem entirely: the
+  demo command always returns absolute paths, so the user never has
+  to think about Tauri's cwd.
+
+**What worked.**
+- All 44 tests pass (42 unit + 2 new integration); clippy clean.
+- `tsc --noEmit` clean. `npm run build` ~8.3 KB JS / 3.6 KB CSS
+  gzipped — up ~1 KB from the previous Phase 8 number, all in the
+  new panel + handler.
+- Tauri dev was already running from a previous session; saving the
+  edits triggered Vite HMR and the served HTML now contains
+  `<h2>Random Demo</h2>` and the new form.
+
+**What didn't / surprises.**
+- Port 1420 was held by the previous `npm run tauri dev` from the
+  Phase-8 probe, so trying to launch a fresh one failed with
+  "EADDRINUSE 1420." Not a bug — Vite HMR picked up the file changes
+  in the still-running session anyway. Future probes should either
+  reuse the running dev server or `Stop-Process` first.
+- First TS draft had `onGenerateDemo` defined before being wired into
+  the bootstrap `DOMContentLoaded`, which the IDE flagged as "declared
+  but never read." Added the submit listener and the warning cleared.
+
+**Decisions made.**
+- **Inline xorshift PRNG, not `rand`.** Ten lines, deterministic, zero
+  dep weight. `rand`'s thread-local entropy and distributions would
+  be useful in a real fuzz harness; here we want reproducibility, and
+  the test seed (`0x9E37_79B9_7F4A_7C15` — golden-ratio derived) is
+  the contract.
+- **Demo dir defaults to `%LOCALAPPDATA%\gpuhash\demo\`.** Matches
+  the existing `sessions/` location pattern. `GPUHASH_DEMO_DIR`
+  override mirrors `GPUHASH_SESSIONS_DIR`, used the same way.
+- **CPU-only integration test.** A GPU variant would catch any
+  CPU↔GPU drift across the full pipeline, but it'd also require a
+  Vulkan adapter at test time, which keeps headless CI fragile. The
+  Phase 3/4/5 GPU↔CPU agreement tests already cover correctness;
+  this test exercises the orchestration layer (loader, source, event
+  stream, summary, finish) on a non-trivial input.
+- **Test seed is a constant.** A flaky failure depending on time-of-
+  day would be a nightmare to debug. If a regression ever changes
+  the planted-set hit rate, it'll fail deterministically and
+  reproducibly.
+
+**Numbers.**
+- 44 / 44 Rust tests; CPU big-audit takes ~130 ms total for both
+  algorithms (~50 ms per audit in release).
+- Generated demo corpus default: 10 000 candidates / 25 planted /
+  MD5. Each Generate click writes ~80 KB to disk.
+
+**Next.**
+- Resume Phase 9. The Random Demo gives us another knob to drive the
+  Phase-9 sweep with — set candidates to 1 M and you've got a CPU
+  reference workload that doesn't depend on having a wordlist file
+  lying around.
+
+---

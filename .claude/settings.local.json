@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "PowerShell(\\(Get-Command cargo-tauri -ErrorAction SilentlyContinue\\).Source; npm view create-tauri-app version 2>$null)",
+      "PowerShell(npm create tauri-app@latest -- --help 2>&1)"
+    ]
+  }
+}

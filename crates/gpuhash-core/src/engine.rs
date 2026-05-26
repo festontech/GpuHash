@@ -95,6 +95,13 @@ impl RunningAttack {
         self.cancel.cancel();
     }
 
+    /// Cheap clone of the cancellation handle. Useful when a frontend wants to
+    /// hand the event-draining `RunningAttack` to a spawned task while keeping
+    /// a separate cancel handle parked in shared state.
+    pub fn cancel_token(&self) -> CancellationToken {
+        self.cancel.clone()
+    }
+
     pub async fn next_event(&mut self) -> Option<EngineEvent> {
         self.events.recv().await
     }
